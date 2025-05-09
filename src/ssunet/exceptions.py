@@ -74,10 +74,13 @@ class UnsupportedInputModeError(DataError):
 
 
 class InvalidDataDimensionError(DataError):
-    """Error raised when the input data has invalid dimensions."""
+    """Error raised when the input data has invalid dimensions.
 
-    def __init__(self):
-        super().__init__("Data must be 3D or 4D")
+    :param message: The error message (optional, default is a generic message)
+    """
+
+    def __init__(self, message: str = "Input data has invalid dimensions."):
+        super().__init__(message)
 
 
 class InvalidImageDimensionError(DataError):
@@ -109,10 +112,13 @@ class MissingPListError(DataError):
 
 
 class MissingReferenceError(DataError):
-    """Error raised when reference data is required."""
+    """Error raised when reference data is required.
 
-    def __init__(self):
-        super().__init__("Reference data is required")
+    :param message: The error message (optional, default is a generic message)
+    """
+
+    def __init__(self, message: str = "Reference data is required."):
+        super().__init__(message)
 
 
 # Model Errors
@@ -169,9 +175,6 @@ class SizeDivisibilityError(PixelShuffleError):
 
     def __init__(self, sizes: tuple):
         super().__init__(f"Size must be divisible by scale, but got {', '.join(map(str, sizes))}")
-
-
-# Add the following exceptions from config.py:
 
 
 class DirectoryNotFoundError(SSUnetError):

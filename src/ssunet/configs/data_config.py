@@ -26,6 +26,7 @@ class DataConfig:
     skip_frames: int = 1
     normalize_target: bool = True
     note: str = ""
+    seed: int | None = None
 
     @property
     def name(self) -> str:

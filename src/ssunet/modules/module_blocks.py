@@ -39,7 +39,7 @@ class UnetBlockConv3D(nn.Module):
         up_mode: str = "transpose",
         merge_mode: str = "concat",
         activation: str = "relu",
-        **kwargs,
+        **kwargs: dict,
     ) -> None:
         """Initializes the UnetBlockConv3D class.
 

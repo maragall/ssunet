@@ -1,34 +1,27 @@
-"""Validation dataset."""
-
+# src/ssunet/datasets/validation.py
 import torch
 
-from ..constants import EPSILON
 from ..utils import _normalize_by_mean
-from .singlevolume import SingleVolumeDataset
+from .base_patch import BasePatchDataset
 
 
-class ValidationDataset(SingleVolumeDataset):
-    """A dataset class for validation data."""
+class ValidationDataset(BasePatchDataset):
+    """Dataset for validation data."""
 
     def __getitem__(self, index: int) -> list[torch.Tensor]:
-        """Get a validation sample."""
-        index = self._index(index)
-        input = self.data[index : index + self.z_size]
+        """Get a single patch from the dataset."""
+        transformed_patches = self._get_transformed_patches()
+        input_patch_processed_cdhw = transformed_patches[0]
 
-        # If secondary data is provided, use it as reference
-        if self.secondary_data is not None:
-            reference = self.secondary_data[index : index + self.z_size]
-            target = _normalize_by_mean(input) if self.config.normalize_target else input
-            output = self._crop_list_items([input / (input.mean() + EPSILON), input, reference])
-        # If no secondary data is provided, use the normalized input as target
+        if self.config.normalize_target:
+            target_for_loss_cdhw = _normalize_by_mean(input_patch_processed_cdhw.clone())
         else:
-            [input] = self._crop_list_items([input])
-            target = _normalize_by_mean(input) if self.config.normalize_target else input
-            output = [target, input]
+            target_for_loss_cdhw = input_patch_processed_cdhw.clone()
 
-        return self._add_channel_dim(self._augment_list(output))
+        output_list = [target_for_loss_cdhw, input_patch_processed_cdhw]
 
-    @property
-    def data_size(self) -> int:
-        """Get the data size."""
-        return self.data.shape[0] - self.z_size + 1
+        if len(transformed_patches) > 1:  # Secondary data (ground truth) was provided
+            ground_truth_processed_cdhw = transformed_patches[1]
+            output_list.append(ground_truth_processed_cdhw)
+
+        return output_list

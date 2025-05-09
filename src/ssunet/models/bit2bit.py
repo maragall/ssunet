@@ -14,7 +14,7 @@ from ..exceptions import InvalidUpModeError
 from ..losses import loss_functions
 from ..modules import BLOCK, conv111
 
-OPTIMIZER = {
+OPTIMIZER: dict[str, type[torch.optim.Optimizer]] = {
     "adam": Adam,
     "sgd": SGD,
     "adamw": AdamW,
@@ -259,21 +259,66 @@ class Bit2Bit(pl.LightningModule):
 
     def _normalize_log_image(
         self,
-        image: torch.Tensor,
+        image_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        """Normalize the image for logging."""
-        normalization = self.kwargs.get("log_image_normalization", "min-max")
-        img = image[:, image.shape[1] // 2, ...]
-        match normalization:
-            case "min-max":
-                return ((img - img.min()) / (img.max() - img.min()) * 255).to(torch.uint8)
-            case "mean-std":
-                return ((img - img.mean()) / img.std() * 255).to(torch.uint8)
-            case "mean":
-                return (img / img.mean() * 128).to(torch.uint8)
-            case _:
-                LOGGER.warning("Normalization method not recognized. Using min-max.")
-                return ((img - img.min()) / (img.max() - img.min()) * 255).to(torch.uint8)
+        """Normalize the image tensor for logging to TensorBoard.
+
+        Expects image_tensor to be (C, D, H, W) or (C, H, W).
+        Extracts a 2D slice (C, H, W) or (H, W) for logging.
+        """
+        normalization_method = self.kwargs.get("log_image_normalization", "min-max")
+        img_display: torch.Tensor
+
+        # If 4D (C, D, H, W), take the middle depth slice
+        if image_tensor.ndim == 4:
+            if image_tensor.shape[1] > 0:  # Depth dimension
+                img_display = image_tensor[:, image_tensor.shape[1] // 2, :, :]
+            else:
+                img_display = image_tensor.squeeze(1)
+                LOGGER.warning(
+                    "Image tensor for logging has unexpected depth shape: %s", image_tensor.shape
+                )
+        elif image_tensor.ndim == 3:
+            img_display = image_tensor
+        elif image_tensor.ndim == 2:
+            img_display = image_tensor
+        else:
+            LOGGER.warning(
+                "Image tensor for logging has unexpected ndim: %s. Attempting to use as is.",
+                image_tensor.shape,
+            )
+            img_display = image_tensor
+
+        img_display = img_display.detach().cpu().float()
+
+        if img_display.ndim == 3 and img_display.shape[0] != 1 and img_display.shape[0] != 3:
+            img_display = img_display[img_display.shape[0] // 2, :, :]
+
+        normalized_img: torch.Tensor
+        if torch.allclose(img_display.min(), img_display.max()):
+            normalized_img = torch.full_like(
+                img_display, 0.0 if normalization_method == "min-max" else 128.0
+            )
+        else:
+            min_val, max_val = img_display.min(), img_display.max()
+            match normalization_method:
+                case "min-max":
+                    normalized_img = (img_display - min_val) / (max_val - min_val + EPSILON) * 255.0
+                case "mean-std":
+                    mean_val, std_val = img_display.mean(), img_display.std()
+                    normalized_img = (img_display - mean_val) / (std_val + EPSILON) * 64.0 + 128.0
+                case "mean":
+                    mean_val = img_display.mean()
+                    normalized_img = img_display / (mean_val + EPSILON) * 128.0
+                case _:
+                    LOGGER.warning(
+                        "Normalization method '%s' not recognized. Using min-max.",
+                        normalization_method,
+                    )
+                    normalized_img = (img_display - min_val) / (max_val - min_val + EPSILON) * 255.0
+
+        # Clamp and convert to uint8
+        return torch.clamp(normalized_img, 0, 255).to(torch.uint8)
 
     def _log_image(
         self,
@@ -291,10 +336,8 @@ class Bit2Bit(pl.LightningModule):
         """Check for conflicts in the model configuration."""
         # NOTE: up_mode 'upsample' is incompatible with merge_mode 'add'
         if (
-            self.config.up_mode == "upsample"
-            and self.config.merge_mode == "add"
-            or self.config.up_mode not in ["upsample", "transpose", "pixelshuffle"]
-        ):
+            self.config.up_mode == "upsample" and self.config.merge_mode == "add"
+        ) or self.config.up_mode not in ["upsample", "transpose", "pixelshuffle"]:
             raise InvalidUpModeError(self.config.up_mode)
 
     def test_step(

@@ -5,6 +5,7 @@ from torch import nn
 
 from ..constants import LOGGER
 from ..exceptions import ShapeMismatchError
+from .activations import GatedReLUMix
 from .partialconv import PartialConv2d, PartialConv3d
 from .pixelshuffle import (
     PixelShuffle2d,
@@ -397,35 +398,22 @@ def merge_conv(
 def activation_function(activation: str, **kwargs) -> nn.Module:
     """Helper function to create activation layers.
 
-    :param activation: activation function
+    :param activation: activation function ("relu" | "leaky" | "silu" | "gelu" | "gated_relu_mix")
+    :param kwargs: additional keyword arguments for leaky relu
 
     :return: activation layer
     """
     match activation:
         case "relu":
-            return nn.ReLU(inplace=kwargs.get("inplace", True))
-        case "leakyrelu":
-            return nn.LeakyReLU(
-                kwargs.get("negative_slope", 0.01),
-                inplace=kwargs.get("inplace", True),
-            )
-        case "prelu":
-            return nn.PReLU(
-                num_parameters=kwargs.get("num_parameters", 1),
-                init=kwargs.get("init", 0.25),
-            )
-        case "gelu":
-            return nn.GELU(approximate=kwargs.get("approximate", "none"))
+            return nn.ReLU(inplace=True)
+        case "leaky":
+            return nn.LeakyReLU(inplace=True, **kwargs)
         case "silu":
-            return nn.SiLU(inplace=kwargs.get("inplace", True))
-        case "tanh":
-            return nn.Tanh()
-        case "sigmoid":
-            return nn.Sigmoid()
-        case "softmax":
-            return nn.Softmax(dim=kwargs.get("dim", None))
-        case "logsoftmax":
-            return nn.LogSoftmax(dim=kwargs.get("dim", None))
+            return nn.SiLU(inplace=True)
+        case "gelu":
+            return nn.GELU()
+        case "gated_relu_mix":
+            return GatedReLUMix()
         case _:
-            LOGGER.warning(f"Unknown activation: {activation}. Using ReLU instead.")
-            return nn.ReLU(inplace=kwargs.get("inplace", True))
+            LOGGER.warning(f"Unknown activation: {activation}. Using ReLU.")
+            return nn.ReLU(inplace=True)

@@ -15,27 +15,41 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "torch",
-    "torchvision",
-    "lightning",
-    "numpy < 2",
-    "h5py",
-    "pyyaml",
-    "tqdm",
-    "matplotlib",
-    "seaborn",
-    "pandas",
-    "pyiqa"
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "numpy>=1.26.4",
+    "h5py>=3.10.0",
+    "pyyaml>=6.0.1",
+    "tqdm>=4.66.2",
+    "matplotlib>=3.8.3",
+    "seaborn>=0.13.2",
+    "pandas>=2.2.1",
+    "lightning>=2.2.1",
+    "tifffile>=2025.3.30",
+    "pyiqa>=0.1.13",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "tox", "pre-commit"]
+dev = [
+    "pytest>=8.0.2",
+    "ruff>=0.3.0",
+    "tox>=4.12.1",
+    "pre-commit>=3.6.0",
+    "jupyter>=1.0.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
 
 [tool.hatch.build.targets.wheel]
 packages = ["ssunet"]
@@ -46,29 +60,28 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 select = [
+    "B",   # flake8-bugbear
+    "BLE", # flake8-blind-except
+    "C4",  # flake8-comprehensions
+    # "C90", # mccabe
+    # "D",   # pydocstyle
+    "DTZ", # flake8-datetimez
     "E",   # pycodestyle errors
+    "ERA", # eradicate
     "F",   # pyflakes
     "I",   # isort
     "N",   # pep8-naming
-    "D",   # pydocstyle
-    "UP",  # pyupgrade
-    "S",   # bandit
-    "BLE", # flake8-blind-except
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "T20", # flake8-print
     "PT",  # flake8-pytest-style
     "Q",   # flake8-quotes
     "RUF", # Ruff-specific rules
-    "DTZ", # flake8-datetimez
-    "ERA", # eradicate
-    "TRY", # tryceratops
-    "C90", # mccabe
+    "S",   # bandit
+    "T20", # flake8-print
+    "UP",  # pyupgrade
 ]
 ignore = ["D100", "D104", "D107"]
 

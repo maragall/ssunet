@@ -1,37 +1,25 @@
-"""Paired dataset."""
-
-import numpy as np
+# src/ssunet/datasets/paired.py
 import torch
 
 from ..exceptions import MissingReferenceError
-from ..utils import _to_tensor
-from .singlevolume import SingleVolumeDataset
+from .base_patch import BasePatchDataset
 
 
-class PairedDataset(SingleVolumeDataset):
-    """Paired dataset using 2 different volumes. The target volume is the reference."""
+class PairedDataset(BasePatchDataset):
+    """Dataset for paired data."""
+
+    def __post_init__(self):
+        """Post initialization function."""
+        super().__post_init__()
+        if self.input_data_raw.secondary_data is None:  # Check raw SSUnetData
+            raise MissingReferenceError("PairedDataset requires secondary_data.")
 
     def __getitem__(self, index: int) -> list[torch.Tensor]:
-        """Get a N2N sample."""
-        start_index = self._index(index)
-        end_index = start_index + self.z_size
-        output = [
-            self.data[start_index:end_index],
-            self.reference[start_index:end_index],
-        ]
-        output = self._crop_list_items(self._rotate_list(output))
-        return self._add_channel_dim(self._augment_list(output))
-
-    @property
-    def data_size(self) -> int:
-        """Get the length of the dataset."""
-        return self.data.shape[0] - self.z_size + 1
-
-    @property
-    def reference(self) -> torch.Tensor:
-        """Get the reference tensor."""
-        if self.input.secondary_data is None:
-            raise MissingReferenceError()
-        if isinstance(self.input.secondary_data, np.ndarray):
-            self.input.secondary_data = _to_tensor(self.input.secondary_data)
-        return self.input.secondary_data
+        """Get a single patch from the dataset."""
+        transformed_patches = self._get_transformed_patches()
+        if len(transformed_patches) != 2:
+            raise RuntimeError(
+                f"PairedDataset expected 2 patches (primary, secondary) "
+                f"from _get_transformed_patches, but got {len(transformed_patches)}."
+            )
+        return transformed_patches

@@ -1,43 +1,56 @@
 # Path configurations
 PATH:
-  # Path to the data directory
-  data_dir: "../tempdata/"
-  data_file: "RES_4341_p=0.00781_m=0.00776.tif"
-  data_begin_slice: 0
-  data_end_slice: 3600
+  # Optional: A base directory. If specified, relative file paths below
+  # (data_file, reference_file, ground_truth_file) will be joined with this.
+  # If these file paths are absolute, base_dir is ignored for them.
+  base_dir: "../tempdata/" # Example common base for all data
 
-  # Path to the reference directory
-  reference_dir: "../tempdata/"
-  reference_file: "RES_4341_p=0.00781_m=0.00776.tif"
-  reference_begin_slice: 3601
-  reference_end_slice: 3856
+  # Primary data source
+  data:
+    # Directory for resolving data_file if it's an integer index,
+    # or if data_file is relative and base_dir is not set.
+    dir: "../tempdata/" # Can be same as base_dir or different
+    file: "RES_4341_p=0.00781_m=0.00776.tif" # Relative to base_dir, or absolute
+    begin_slice: 0
+    end_slice: 3600
 
-  # Path to the ground truth directory
-  ground_truth_dir: "../tempdata/"
-  ground_truth_file: "ref.tif"
-  ground_truth_begin_slice: 3601
-  ground_truth_end_slice: 3856
+  # Reference data source (optional)
+  # Used by PairedDataset as target, or by ValidationDataset as ground truth if no specific ground_truth section.
+  reference: # Optional section
+    dir: "../tempdata/"
+    file: "RES_4341_p=0.00781_m=0.00776.tif"
+    begin_slice: 3601
+    end_slice: 3856
+
+  # Ground truth data source (optional)
+  # Primarily for ValidationDataset if a distinct ground truth is available.
+  ground_truth: # Optional section
+    dir: "../tempdata/"
+    file: "ref.tif"
+    begin_slice: 3601
+    end_slice: 3856
 
 # Data configurations
 DATA:
-  xy_size: 256 # Size of the sampled image in the xy plane, 128 is a good choice
-  z_size: 32 # Size of the sampled image in the z direction, 32 is a good choice
-  virtual_size: 1200 # Size/length of the virtual image in each batch, use 0 for the entire dataset
-  augments: False # Whether to apply data augmentation, False is a good choice for natural images
-  rotation: 0 # Rotation of the sampled image, can cause artifacts if not 0
-  random_crop: True # Whether to apply random cropping, True is a good choice
+  xy_size: 256 # Size of the sampled image in the xy plane
+  z_size: 32 # Size of the sampled image in the z direction (depth of the patch)
+  virtual_size: 1200 # Number of samples per epoch. Use 0 for a length derived from data depth (less common for random patch sampling).
+  augments: False # Whether to apply data augmentation (flips, transpose)
+  rotation: 0 # Max degrees for random rotation (0 for no rotation)
+  random_crop: True # True for random patch selection, False for center patch
   skip_frames: 1 # Number of frames to skip between each sampled data stack, 1 is no skipping
-  normalize_target: True # Whether to normalize the target, True is a good choice
-  note: "test" # Note for the data
+  normalize_target: True # For BinomDataset target or ValidationDataset target_for_loss
+  note: "test_run_v2" # Note for this data configuration
+  seed: Null # Optional: Seed for random_crop and augmentations in BasePatchDataset
 
-# Split configurations
+# Split configurations (for BinomDataset)
 SPLIT:
-  method: "signal" # Options: "signal" | "db" | "fixed" | "list"
-  min_p: 0.000001 # Minimum p level, db or the fixed p
-  max_p: 0.999999 # Maximum p level
-  p_list: Null # List of p levels if method is "list"
-  normalize_target: True # Whether to normalize the target
-  seed: Null # Seed for the random number generator
+  method: "signal" # Options: "signal" | "fixed" | "list"
+  min_p: 0.000001 # Minimum p level (for "signal" or "fixed" if p_list absent)
+  max_p: 0.999999 # Maximum p level (for "signal")
+  p_list: Null # List of p levels if method is "list" (e.g., [0.1, 0.5, 0.9])
+  normalize_target: True # Whether to normalize the target component after splitting
+  seed: Null # Seed for p-value sampling randomness in BinomDataset
 
 # Model configurations
 MODEL:
