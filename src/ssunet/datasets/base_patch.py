@@ -262,6 +262,12 @@ class BasePatchDataset(Dataset, ABC):
         return item_list_cdhw
 
     @abstractmethod
+    @property
+    def validation_dataset(self) -> "BasePatchDataset":
+        """Set the validation data."""
+        pass
+
+    @abstractmethod
     def __getitem__(self, index: int) -> list[torch.Tensor]:
         """Get a single patch from the dataset.
 

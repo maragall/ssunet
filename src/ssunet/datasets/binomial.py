@@ -4,9 +4,8 @@ from numpy.random import choice, rand, seed
 from torch.distributions.binomial import Binomial
 
 from ..configs import DataConfig, SplitParams, SSUnetData
-from ..configs.file_config import ConfigError  # Import ConfigError
 from ..constants import LOGGER
-from ..exceptions import InvalidPValueError, MissingPListError
+from ..exceptions import ConfigError, InvalidPValueError, MissingPListError
 from ..utils import _normalize_by_mean
 from .base_patch import BasePatchDataset
 
@@ -181,3 +180,9 @@ class BinomDataset(BasePatchDataset):
         )
         binom_dist = Binomial(total_count=clamped_input, probs=probs_tensor)
         return binom_dist.sample()
+
+    @property
+    def validation_dataset(self) -> "BinomDataset":
+        """Set the validation data."""
+        validation_dataset = self.deepcopy()
+        return validation_dataset

@@ -12,7 +12,7 @@ import torch
 from ..constants import DEFAULT_CONFIG_PATH
 from ..utils import _load_yaml
 from .data_config import DataConfig
-from .file_config import PathConfig, SplitParams
+from .file_config import FileSourceConfig, PathConfig, SplitParams
 from .model_config import ModelConfig
 from .train_config import LoaderConfig, TrainConfig
 
@@ -143,14 +143,35 @@ class MasterConfig:
         :returns: MasterConfig instance
         """
         config_path = Path(config_path)
-        config = _load_yaml(config_path)
+        config_dict = _load_yaml(config_path)
+
+        path_section = config_dict.get("PATH", {})
+
+        data_source_dict = path_section.get("data", {})
+        data_fsc = FileSourceConfig(**data_source_dict) if data_source_dict else FileSourceConfig()
+
+        reference_source_dict = path_section.get("reference")
+        reference_fsc = FileSourceConfig(**reference_source_dict) if reference_source_dict else None
+
+        ground_truth_source_dict = path_section.get("ground_truth")
+        ground_truth_fsc = (
+            FileSourceConfig(**ground_truth_source_dict) if ground_truth_source_dict else None
+        )
+
+        path_cfg = PathConfig(
+            base_dir=path_section.get("base_dir"),
+            data=data_fsc,
+            reference=reference_fsc,
+            ground_truth=ground_truth_fsc,
+        )
+
         master_config = MasterConfig(
-            path_config=PathConfig(**config["PATH"]),
-            data_config=DataConfig(**config["DATA"]),
-            split_params=SplitParams(**config["SPLIT"]),
-            model_config=ModelConfig(**config["MODEL"]),
-            loader_config=LoaderConfig(**config["LOADER"]),
-            train_config=TrainConfig(**config["TRAIN"]),
+            path_config=path_cfg,
+            data_config=DataConfig(**config_dict["DATA"]),
+            split_params=SplitParams(**config_dict["SPLIT"]),
+            model_config=ModelConfig(**config_dict["MODEL"]),
+            loader_config=LoaderConfig(**config_dict["LOADER"]),
+            train_config=TrainConfig(**config_dict["TRAIN"]),
         )
         if len(config_path.parent.name) >= len(master_config.name):
             master_config.time_stamp = master_config.name[:15]

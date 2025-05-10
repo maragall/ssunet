@@ -296,61 +296,73 @@ class PathConfig:
                 # 4D: CDHW
                 # 3D: DHW
 
-                # Attempt permutation only if axes_from_tiff is known and data is not scalar
-                if axes_from_tiff and raw_data_from_tiff.ndim > 0:
-                    # Simple map: key is tifffile.series.axes, value is permutation for np.transpose
-                    # and the target axes string for logging.
-                    # This needs to be comprehensive for common cases.
-                    permutation_map = {
-                        # Target: DHW (3D)
-                        "ZYX": ((0, 1, 2), "DHW"),  # No change
-                        "YXZ": (
-                            (1, 0, 2),
-                            "DHW",
-                        ),  # HWD -> DHW (permute D,H) - no, (2,0,1) Y,X,Z -> Z,Y,X
-                        "XYZ": ((2, 0, 1), "DHW"),  # WHD -> DHW
-                        # Target: CDHW (4D)
-                        "CZYX": ((0, 1, 2, 3), "CDHW"),  # No change
-                        "ZCYX": ((1, 0, 2, 3), "CDHW"),  # DCYW -> CDHW
-                        "CZXY": ((0, 1, 3, 2), "CDHW"),  # CDWH -> CDHW
-                        "TZYX": (
-                            (0, 1, 2, 3),
-                            "CDHW",
-                        ),  # If TZYX is 4D, treat T as C for PathConfig
-                        # Target: TCDHW (5D)
-                        "TCZYX": ((0, 1, 2, 3, 4), "TCDHW"),  # No change
-                        "TZCYX": ((0, 2, 1, 3, 4), "TCDHW"),  # TDCYW -> TCDHW
-                    }
-
-                    if axes_from_tiff in permutation_map:
-                        perm_indices, target_axes = permutation_map[axes_from_tiff]
-                        if len(perm_indices) == raw_data_from_tiff.ndim:
-                            try:
-                                permuted_data = np.transpose(raw_data_from_tiff, perm_indices)
-                                final_axes_order_str = target_axes
-                                LOGGER.info(
-                                    f"Permuted '{axes_from_tiff}' to '{final_axes_order_str}', "
-                                    f"new_shape={permuted_data.shape}"
-                                )
-                            except ValueError as e:
-                                LOGGER.error(
-                                    f"Permutation from '{axes_from_tiff}' failed: {e}. "
+                # --- Begin new permutation logic for TZYX and 5D cases ---
+                final_ndim = raw_data_from_tiff.ndim
+                if axes_from_tiff and final_ndim > 0:
+                    if final_ndim == 4 and axes_from_tiff == "TZYX":
+                        # Input is (T,Z,Y,X). Expand to (T,1,Z,Y,X) for BasePatchDataset 5D path.
+                        # This makes C_eff=1, D_eff=Z. total_time_frames will be T.
+                        permuted_data = raw_data_from_tiff[:, np.newaxis, :, :, :]
+                        final_axes_order_str = "TCDHW"  # Semantic meaning after expand_dims
+                        LOGGER.info(
+                            f"Interpreted TZYX as T(1)ZYX (TCDHW semantically). "
+                            f"New shape: {permuted_data.shape}"
+                        )
+                    elif final_ndim == 5:
+                        if axes_from_tiff == "TCZYX":
+                            permuted_data = raw_data_from_tiff
+                            final_axes_order_str = "TCDHW"
+                        elif axes_from_tiff == "TZCYX":
+                            permuted_data = np.transpose(raw_data_from_tiff, (0, 2, 1, 3, 4))
+                            final_axes_order_str = "TCDHW"
+                        else:
+                            LOGGER.warning(f"Unknown 5D axes '{axes_from_tiff}'. Using raw order.")
+                            final_axes_order_str = axes_from_tiff
+                    else:
+                        # Fallback to original permutation map for other cases
+                        permutation_map = {
+                            # Target: DHW (3D)
+                            "ZYX": ((0, 1, 2), "DHW"),  # No change
+                            "YXZ": ((1, 0, 2), "DHW"),
+                            "XYZ": ((2, 0, 1), "DHW"),
+                            "QYX": ((0, 1, 2), "DHW"),
+                            "IYX": ((0, 1, 2), "DHW"),
+                            "CZYX": ((0, 1, 2, 3), "CDHW"),
+                            "ZCYX": ((1, 0, 2, 3), "CDHW"),
+                            "CZXY": ((0, 1, 3, 2), "CDHW"),
+                            "TZYX": ((0, 1, 2, 3), "CDHW"),  # If not handled above
+                            # Target: TCDHW (5D)
+                            "TCZYX": ((0, 1, 2, 3, 4), "TCDHW"),
+                            "TZCYX": ((0, 2, 1, 3, 4), "TCDHW"),
+                        }
+                        if axes_from_tiff in permutation_map:
+                            perm_indices, target_axes = permutation_map[axes_from_tiff]
+                            if len(perm_indices) == raw_data_from_tiff.ndim:
+                                try:
+                                    permuted_data = np.transpose(raw_data_from_tiff, perm_indices)
+                                    final_axes_order_str = target_axes
+                                    LOGGER.info(
+                                        f"Permuted '{axes_from_tiff}' to '{final_axes_order_str}', "
+                                        f"new_shape={permuted_data.shape}"
+                                    )
+                                except ValueError as e:
+                                    LOGGER.error(
+                                        f"Permutation from '{axes_from_tiff}' failed: {e}. "
+                                        f"Using raw order."
+                                    )
+                                    final_axes_order_str = axes_from_tiff  # Revert
+                            else:
+                                LOGGER.warning(
+                                    f"Permutation map for '{axes_from_tiff}' has incorrect ndim. "
                                     f"Using raw order."
                                 )
-                                final_axes_order_str = axes_from_tiff  # Revert
+                                final_axes_order_str = axes_from_tiff
                         else:
                             LOGGER.warning(
-                                f"Permutation map for '{axes_from_tiff}' has incorrect ndim. "
-                                f"Using raw order."
+                                f"TIFF {path_to_load} has axes '{axes_from_tiff}' "
+                                f"not in explicit permutation map. Using raw data order."
                             )
-                            final_axes_order_str = axes_from_tiff
-                    elif axes_from_tiff:  # Axes known, but not in our simple map
-                        LOGGER.warning(
-                            f"TIFF {path_to_load} has axes '{axes_from_tiff}' "
-                            f"not in explicit permutation map. Using raw data order."
-                        )
-                        # permuted_data is already raw_data_from_tiff
-
+                            # permuted_data is already raw_data_from_tiff
                 elif not axes_from_tiff and raw_data_from_tiff.ndim > 0:  # No axes info at all
                     LOGGER.warning(
                         f"TIFF {path_to_load} has no axes metadata. "

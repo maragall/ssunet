@@ -1,34 +1,29 @@
-# Path configurations
-PATH:
-  # Optional: A base directory. If specified, relative file paths below
-  # (data_file, reference_file, ground_truth_file) will be joined with this.
-  # If these file paths are absolute, base_dir is ignored for them.
-  base_dir: "../tempdata/" # Example common base for all data
+# config.yml (or your DEFAULT_CONFIG_PATH file)
 
-  # Primary data source
-  data:
-    # Directory for resolving data_file if it's an integer index,
-    # or if data_file is relative and base_dir is not set.
-    dir: "../tempdata/" # Can be same as base_dir or different
-    file: "RES_4341_p=0.00781_m=0.00776.tif" # Relative to base_dir, or absolute
+PATH:
+  base_dir: "../tempdata/" # Or your actual base data directory
+
+  data: # Primary training data
+    # dir: "../tempdata/" # Optional if file is relative to base_dir or absolute
+    file: "RES_4341_p=0.00781_m=0.00776.tif" # Example training data file
     begin_slice: 0
     end_slice: 3600
+    # expected_format_hint: "ZYX" # Optional, if needed for ambiguous TIFFs
+    # slice_dimension_name: "Z"   # Optional, if slicing on non-0th dim
 
-  # Reference data source (optional)
-  # Used by PairedDataset as target, or by ValidationDataset as ground truth if no specific ground_truth section.
-  reference: # Optional section
-    dir: "../tempdata/"
-    file: "RES_4341_p=0.00781_m=0.00776.tif"
+  reference: # For validation dataset's primary input (often noisy validation data)
+    # dir: "../tempdata/"
+    file: "RES_4341_p=0.00781_m=0.00776.tif" # Example validation noisy data
     begin_slice: 3601
     end_slice: 3856
+    # expected_format_hint: "ZYX"
 
-  # Ground truth data source (optional)
-  # Primarily for ValidationDataset if a distinct ground truth is available.
-  ground_truth: # Optional section
-    dir: "../tempdata/"
-    file: "ref.tif"
-    begin_slice: 3601
-    end_slice: 3856
+  ground_truth: # For validation dataset's secondary input (clean ground truth for metrics)
+    # dir: "../tempdata/"
+    file: "ref.tif" # Example clean reference/ground truth
+    begin_slice: 3601 # Or 0 if it's a separate file for the validation range
+    end_slice: 3856 # Or -1
+    # expected_format_hint: "ZYX"
 
 # Data configurations
 DATA:

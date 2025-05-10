@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random  # Ensure random is imported for edge case test
 from typing import Any
 from unittest.mock import patch
 
@@ -16,7 +17,10 @@ from src.ssunet.datasets import (
     ValidationDataset,
 )
 from src.ssunet.datasets.base_patch import BasePatchDataset
+from src.ssunet.datasets.temporal_sum_split import TemporalSumSplitDataset  # Added import
 from src.ssunet.exceptions import (
+    ConfigError,
+    DataError,
     InvalidDataDimensionError,
     InvalidPValueError,
     MissingPListError,
@@ -47,8 +51,11 @@ def data_config_case3() -> DataConfig:
     )
 
 
+# Fixture name from instruction, using case2 config
 @pytest.fixture
 def data_config_case2() -> DataConfig:
+    """This config is compatible with the dummy data shape in
+    test_split_temporal_frames_logic."""
     return DataConfig(
         z_size=16,
         xy_size=32,
@@ -575,3 +582,213 @@ class TestValidationDataset:
 @pytest.fixture
 def data_config_n2n_test() -> DataConfig:
     return DataConfig(z_size=60, xy_size=128)
+
+
+class TestTemporalSumSplitDataset:
+    def test_init_requires_min_t2(
+        self,
+        data_config_case2: DataConfig,
+        split_params_signal: SplitParams,
+    ) -> None:
+        # Create data with T=1 and sufficient depth for the config's z_size
+        # data_config_case2 has z_size=16, so depth must be >= 16.
+        data_t1 = SSUnetData(
+            primary_data=torch.rand(1, 1, 20, 32, 32)
+        )  # T,C,D,H,W - Increased depth to 20
+        with pytest.raises(DataError, match="requires input data with at least 2 time frames"):
+            TemporalSumSplitDataset(data_t1, data_config_case2, split_params_signal)
+
+    @pytest.mark.parametrize(
+        ("t_total", "c_eff", "d_patch", "h_patch", "w_patch"),
+        [
+            (10, 1, 16, 32, 32),  # T, C, D, H, W (for the patch after spatial sampling)
+            (5, 3, 16, 32, 32),
+            (2, 1, 16, 32, 32),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("p_method", "p_values"),
+        [
+            ("signal", {"min_p": 0.1, "max_p": 0.9}),
+            ("fixed", {"p_list": [0.5]}),
+            ("fixed", {"min_p": 0.3}),  # Test fixed using min_p if p_list is None
+            ("list", {"p_list": [0.25, 0.75]}),
+        ],
+    )
+    def test_split_temporal_frames_logic(
+        self,
+        t_total: int,
+        c_eff: int,
+        d_patch: int,
+        h_patch: int,
+        w_patch: int,
+        p_method: str,
+        p_values: dict[str, Any],
+    ) -> None:
+        # Create dummy config and split_params
+        # Config for spatial patch extraction - needs to be compatible with dummy data shape
+        test_data_config = DataConfig(
+            z_size=d_patch,
+            xy_size=h_patch,  # Assuming H_patch == W_patch
+            virtual_size=10,
+            seed=42,
+        )
+
+        # Construct split_params based on p_method and p_values
+        if p_method == "signal":
+            split_params = SplitParams(
+                method="signal", min_p=p_values["min_p"], max_p=p_values["max_p"], seed=123
+            )
+        elif p_method == "fixed":
+            if "p_list" in p_values:
+                split_params = SplitParams(method="fixed", p_list=p_values["p_list"], seed=123)
+            else:
+                split_params = SplitParams(method="fixed", min_p=p_values["min_p"], seed=123)
+        elif p_method == "list":
+            split_params = SplitParams(method="list", p_list=p_values["p_list"], seed=123)
+        else:
+            pytest.fail(f"Unsupported p_method: {p_method}")
+
+        dummy_raw_data_shape = (
+            t_total,
+            c_eff,
+            d_patch + 5,
+            h_patch + 5,
+            w_patch + 5,
+        )  # Larger raw data
+        dummy_ssu_data = SSUnetData(primary_data=torch.rand(*dummy_raw_data_shape))
+
+        dataset_instance = TemporalSumSplitDataset(dummy_ssu_data, test_data_config, split_params)
+
+        # Create the input tensor for _split_temporal_frames
+        patch_t_first_dims = (
+            torch.rand(t_total, c_eff, d_patch, h_patch, w_patch) * 10
+        )  # Add some values
+
+        input_summed, target_normalized = dataset_instance._split_temporal_frames(
+            patch_t_first_dims
+        )
+
+        # 1. Check output shapes
+        expected_spatial_shape = (c_eff, d_patch, h_patch, w_patch)
+        assert input_summed.shape == expected_spatial_shape, "Shape of summed input is incorrect"
+        assert (
+            target_normalized.shape == expected_spatial_shape
+        ), "Shape of normalized target is incorrect"
+
+        # 2. Check dtypes
+        assert input_summed.dtype == torch.float32
+        assert target_normalized.dtype == torch.float32
+
+        if not torch.allclose(target_normalized, torch.zeros_like(target_normalized)):
+            assert not torch.isnan(
+                target_normalized
+            ).any(), "Target contains NaN after normalization"
+            assert not torch.isinf(
+                target_normalized
+            ).any(), "Target contains Inf after normalization"
+
+    def test_split_temporal_frames_edge_cases_m_n_counts(self) -> None:
+        # Test T=2, should result in m=1, n=1 regardless of p_for_n
+        config = DataConfig(z_size=8, xy_size=8)
+        split_params_varied_p = SplitParams(method="signal", min_p=0.01, max_p=0.99, seed=1)
+
+        t_total, c_eff, d_patch, h_patch, w_patch = 2, 1, 8, 8, 8
+        dummy_raw_data_shape = (t_total, c_eff, d_patch + 5, h_patch + 5, w_patch + 5)
+        dummy_ssu_data = SSUnetData(primary_data=torch.rand(*dummy_raw_data_shape))
+        dataset = TemporalSumSplitDataset(dummy_ssu_data, config, split_params_varied_p)
+
+        patch_t_first_dims = torch.rand(t_total, c_eff, d_patch, h_patch, w_patch)
+
+        # Test multiple times due to randomness in p_for_n for "signal"
+        random.seed(1)  # Seed for reproducibility
+        for _ in range(10):
+            # Calculate p_for_n as done in the method
+            p_for_n = (
+                random.random() * (dataset.split_params.max_p - dataset.split_params.min_p)  # noqa: S311
+                + dataset.split_params.min_p
+            )
+            n_count_float = t_total * p_for_n
+            n_count_actual = round(n_count_float)
+            n_count_clamped = max(1, min(n_count_actual, t_total - 1))
+            m_count_clamped = t_total - n_count_clamped
+            dataset._split_temporal_frames(patch_t_first_dims)
+
+            assert (
+                n_count_clamped == 1
+            ), f"For T={t_total}, n_count should be 1, got {n_count_clamped} with p={p_for_n:.4f}"
+            assert (
+                m_count_clamped == 1
+            ), f"For T={t_total}, m_count should be 1, got {m_count_clamped} with p={p_for_n:.4f}"
+
+    def test_split_params_errors(self) -> None:
+        config = DataConfig(z_size=8, xy_size=8)
+        dummy_data = SSUnetData(primary_data=torch.rand(2, 1, 10, 10, 10))
+
+        # Test InvalidPValueError for method="list" with empty p_list
+        dataset_list_empty = TemporalSumSplitDataset(
+            dummy_data, config, SplitParams(method="list", p_list=[])
+        )
+        with pytest.raises(InvalidPValueError, match="p_list is required for 'list' method"):
+            dataset_list_empty._split_temporal_frames(torch.rand(2, 1, 5, 5, 5))
+
+        with pytest.raises(ConfigError, match="p_list values must be between 0 and 1"):
+            SplitParams(method="list", p_list=[0.5, 0.0, 1.0])
+
+        # Test ConfigError for unsupported method (ConfigError is raised in SplitParams)
+        with pytest.raises(
+            ConfigError,
+            match="Invalid SPLIT.method",
+        ):
+            SplitParams(method="unknown_method")
+
+        # Test ConfigError for min_p > max_p in SplitParams (signal method)
+        with pytest.raises(ConfigError, match="For 'signal' method"):
+            SplitParams(method="signal", min_p=0.5, max_p=0.4)
+
+        # Note: Validation for p_list values <= 0 or >= 1 for method="fixed"
+        # is not currently done in SplitParams.__post_init__.
+        # If this validation is needed, it should be added to SplitParams
+        # or tested when the p_list is used (e.g., in _split_temporal_frames).
+
+    # Test for __getitem__ shapes
+    def test_getitem_output_shapes(
+        self,
+        ssunet_data_5d_tcdhw: SSUnetData,
+        data_config_case3: DataConfig,
+        split_params_signal: SplitParams,
+    ) -> None:
+        # ssunet_data_5d_tcdhw: T=5, C=3, D=100, H=128, W=128
+        # data_config_case3: z_size=32, xy_size=64
+        # This config is compatible as raw data is larger than patch size.
+
+        dataset = TemporalSumSplitDataset(
+            ssunet_data_5d_tcdhw, data_config_case3, split_params_signal
+        )
+        item = dataset[0]  # [input_sum, target_norm]
+
+        assert len(item) == 2
+        cfg = data_config_case3
+        # Effective channels from ssunet_data_5d_tcdhw is 3
+        expected_spatial_shape = (3, cfg.z_size, cfg.xy_size, cfg.xy_size)
+        assert item[0].shape == expected_spatial_shape
+        assert item[1].shape == expected_spatial_shape
+
+    def test_getitem_with_secondary_data(
+        self,
+        ssunet_data_secondary_matching_primary_tcdhw: SSUnetData,
+        data_config_case2: DataConfig,
+        split_params_signal: SplitParams,
+    ) -> None:
+        dataset = TemporalSumSplitDataset(
+            ssunet_data_secondary_matching_primary_tcdhw, data_config_case2, split_params_signal
+        )
+        item = dataset[0]  # [input_sum, target_norm, gt_norm]
+
+        assert len(item) == 3
+        cfg = data_config_case2
+        # Effective channels from ssunet_data_secondary_matching_primary_tcdhw is 3
+        expected_spatial_shape = (3, cfg.z_size, cfg.xy_size, cfg.xy_size)
+        assert item[0].shape == expected_spatial_shape  # input sum
+        assert item[1].shape == expected_spatial_shape  # target norm
+        assert item[2].shape == expected_spatial_shape  # gt norm (mean of T frames of secondary)
