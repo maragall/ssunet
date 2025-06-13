@@ -7,9 +7,10 @@ import torchvision.transforms.v2.functional as tf
 from numpy.random import rand, randint, seed
 from torch.utils.data import Dataset
 
-from ..configs import DataConfig, SSUnetData
+from ..configs import DataConfig
 from ..exceptions import InvalidDataDimensionError
-from ..utils import LOGGER, _lucky, _to_tensor
+from ..utils import LOGGER, _lucky, to_tensor
+from .ssunet_data import SSUnetData
 
 
 class BasePatchDataset(Dataset, ABC):
@@ -113,14 +114,14 @@ class BasePatchDataset(Dataset, ABC):
         secondary_vol_raw = self.input_data_raw.secondary_data
 
         primary_tensor_full = (
-            _to_tensor(primary_vol_raw)
+            to_tensor(primary_vol_raw)
             if isinstance(primary_vol_raw, np.ndarray)
             else primary_vol_raw
         )
         secondary_tensor_full: torch.Tensor | None = None
         if secondary_vol_raw is not None:
             secondary_tensor_full = (
-                _to_tensor(secondary_vol_raw)
+                to_tensor(secondary_vol_raw)
                 if isinstance(secondary_vol_raw, np.ndarray)
                 else secondary_vol_raw
             )
@@ -260,12 +261,6 @@ class BasePatchDataset(Dataset, ABC):
             if _lucky():
                 item_list_cdhw = [torch.flip(item, [-2]) for item in item_list_cdhw]
         return item_list_cdhw
-
-    @abstractmethod
-    @property
-    def validation_dataset(self) -> "BasePatchDataset":
-        """Set the validation data."""
-        pass
 
     @abstractmethod
     def __getitem__(self, index: int) -> list[torch.Tensor]:

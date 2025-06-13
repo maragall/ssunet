@@ -7,11 +7,12 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from tifffile import TiffFile  # Added TiffPage, though not explicitly used in final load
+from tifffile import TiffFile
 
 from ..constants import EPSILON, LOGGER
+from ..datasets.ssunet_data import SSUnetData
 from ..exceptions import (
-    ConfigError,  # Assuming ConfigError is moved to ssunet.exceptions
+    ConfigError,
     DirectoryNotFoundError,
     FileIndexOutOfRangeError,
     FileNotFoundError,
@@ -20,13 +21,9 @@ from ..exceptions import (
     NoDataFileAvailableError,
     UnknownFileTypeError,
 )
-from .data_config import SSUnetData
 
 PathLike = str | Path
 FileInput = int | str | Path
-
-
-# Removed local ConfigError, assuming it's in ssunet.exceptions
 
 
 class FileType(Enum):
@@ -38,20 +35,15 @@ class FileType(Enum):
 
 
 @dataclass
-class FileSourceConfig:
+class FileSource:
     """Configuration for a single data source (e.g., data, reference, ground_truth)."""
 
     dir: PathLike | None = None
     file: FileInput | None = None
     begin_slice: int = 0
     end_slice: int = -1
-    # Optional user hint for ambiguous TIFF dimension interpretation
-    # Examples: "ZYX", "CZYX", "TCZYX", "ASSUME_DHW_STACK"
-    # If provided, this can guide permutation if tifffile.series.axes is missing/ambiguous.
     expected_format_hint: str | None = None
     expected_shape_hint: tuple[int, ...] | None = None
-    # Optional: name of the dimension to slice along if not the first after permutation.
-    # E.g., "Z", "T". If None, slices along the first dimension of the (permuted) array.
     slice_dimension_name: str | None = None
 
     resolved_path: Path | None = field(init=False, default=None)
@@ -63,9 +55,11 @@ class PathConfig:
     """Configuration for paths."""
 
     base_dir: PathLike | None = None
-    data: FileSourceConfig = field(default_factory=FileSourceConfig)
-    reference: FileSourceConfig | None = None
-    ground_truth: FileSourceConfig | None = None
+    data: FileSource = field(default_factory=FileSource)
+    reference: FileSource | None = None
+    ground_truth: FileSource | None = None
+
+    _raw_data_cache: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.base_dir:
@@ -74,21 +68,20 @@ class PathConfig:
                 LOGGER.warning(
                     f"PATH.base_dir {self.base_dir} does not exist. Relative paths may fail."
                 )
-
         self._resolve_file_source(self.data, FileType.DATA, is_required=True)
-        if self.reference:  # Ensure self.reference is not None before calling
+        if self.reference:
             self._resolve_file_source(self.reference, FileType.REFERENCE)
-        if self.ground_truth:  # Ensure self.ground_truth is not None
+        if self.ground_truth:
             self._resolve_file_source(self.ground_truth, FileType.GROUND_TRUTH)
-
         self._validate_all_slices()
 
     def _resolve_file_source(
-        self, source_cfg: FileSourceConfig, file_type: FileType, is_required: bool = False
+        self, source_cfg: FileSource, file_type: FileType, is_required: bool = False
     ) -> None:
+        # ... (resolution logic remains the same)
         if source_cfg.file is None:
             if is_required:
-                raise ConfigError(  # Use imported ConfigError
+                raise ConfigError(
                     f"PathConfig: '{file_type.name.lower()}.file' is required but not provided."
                 )
             source_cfg.is_available = False
@@ -107,9 +100,7 @@ class PathConfig:
         resolved_file: Path | None = None
 
         if isinstance(file_input, int):
-            if (
-                not source_dir_path
-            ):  # This check implies source_dir_path MUST exist for int indexing
+            if not source_dir_path:
                 raise ConfigError(
                     f"'{file_type.name.lower()}.dir' must be provided and exist when "
                     f"'{file_type.name.lower()}.file' is an integer index."
@@ -119,7 +110,7 @@ class PathConfig:
                 if not (0 <= file_input < len(files_in_dir)):
                     raise FileIndexOutOfRangeError(file_type, file_input)
                 resolved_file = files_in_dir[file_input]
-            except Exception as err:  # Catch generic StopIteration or other fs errors
+            except Exception as err:
                 raise FileIndexOutOfRangeError(file_type, file_input) from err
 
         elif isinstance(file_input, str | Path):
@@ -127,13 +118,11 @@ class PathConfig:
             if not file_path.is_absolute():
                 if self.base_dir and self.base_dir.exists():
                     resolved_file = self.base_dir / file_path
-                elif (
-                    source_dir_path and source_dir_path.exists()
-                ):  # Fallback if base_dir not set/exist
+                elif source_dir_path and source_dir_path.exists():
                     resolved_file = source_dir_path / file_path
-                else:  # Relative to CWD
+                else:
                     resolved_file = file_path.resolve()
-            else:  # Absolute path
+            else:
                 resolved_file = file_path
 
             if not resolved_file.exists():
@@ -148,8 +137,9 @@ class PathConfig:
         source_cfg.is_available = True
 
     def _validate_all_slices(self) -> None:
-        sources_to_validate = {}  # Use a dictionary
-        if self.data and self.data.is_available:  # data is always present due to default_factory
+        # ... (validation logic remains the same)
+        sources_to_validate = {}
+        if self.data and self.data.is_available:
             sources_to_validate["data"] = self.data
         if self.reference and self.reference.is_available:
             sources_to_validate["reference"] = self.reference
@@ -157,409 +147,373 @@ class PathConfig:
             sources_to_validate["ground_truth"] = self.ground_truth
 
         for name, source_cfg_val in sources_to_validate.items():
-            # source_cfg_val will not be None here due to checks above
             begin, end = source_cfg_val.begin_slice, source_cfg_val.end_slice
             if begin < 0 or (end != -1 and end <= begin):
                 raise InvalidSliceRangeError(name, begin, end)
 
-    def _load_from_source(
-        self, source_cfg: FileSourceConfig | None, method: Callable | None
-    ) -> np.ndarray | None:
-        """Loads data from a file source, handling TIFF, HDF5, or custom method.
+    def _get_raw_data_cache_key(
+        self, source_cfg: FileSource, file_suffix_lower: str, method: Callable | None
+    ) -> tuple:
+        """Creates a key for caching the raw, fully loaded and processed (but un-sliced) data."""
+        if file_suffix_lower in [".tif", ".tiff"]:
+            return (
+                source_cfg.resolved_path,
+                "tiff",
+                source_cfg.expected_format_hint,  # Affects reshape/permutation
+                source_cfg.expected_shape_hint,  # Affects reshape
+            )
+        elif file_suffix_lower in [".h5", ".hdf5"]:
+            return (
+                source_cfg.resolved_path,
+                "hdf5",
+                source_cfg.expected_format_hint,  # HDF5 dataset name
+            )
+        elif method:
+            return (
+                source_cfg.resolved_path,
+                id(method),  # Custom loader identity
+            )
+        else:
+            # This should ideally be caught before calling this function
+            raise UnknownFileTypeError(f"Cannot determine cache key for {source_cfg.resolved_path}")
 
-        :param source_cfg: The file source configuration.
-        :param method: Optional custom method for loading non-TIFF/HDF5 files.
-        :return: Loaded data as np.ndarray or None.
-        """
+    def _load_from_source(
+        self, source_cfg: FileSource | None, method: Callable | None
+    ) -> np.ndarray | None:
         if not source_cfg or not source_cfg.is_available or not source_cfg.resolved_path:
             return None
 
         path_to_load = source_cfg.resolved_path
-        begin_slice_user, end_slice_user = source_cfg.begin_slice, source_cfg.end_slice
-        data: np.ndarray | None = None
+        file_suffix_lower = path_to_load.suffix.lower()
 
-        if path_to_load.suffix.lower() in [".tif", ".tiff"]:
-            with TiffFile(str(path_to_load)) as tif:
-                if not tif.series or not tif.series[0] or not tif.series[0].shape:
-                    raise UnknownFileTypeError(
-                        f"Cannot determine series shape for TIFF: {path_to_load}"
-                    )
+        raw_cache_key = self._get_raw_data_cache_key(source_cfg, file_suffix_lower, method)
 
-                series = tif.series[0]
-                raw_data_from_tiff = series.asarray()
-                axes_hint = source_cfg.expected_format_hint
-                shape_hint = source_cfg.expected_shape_hint
-                series_axes_str = series.axes.upper() if series.axes else ""
-                axes_from_tiff = (axes_hint.upper() if axes_hint else series_axes_str) or ""
+        data_to_slice_from: np.ndarray
+        final_axes_order_str_for_slicing: str | None = None
 
-                current_data_for_processing = raw_data_from_tiff
-                current_axes = axes_from_tiff
+        if raw_cache_key in self._raw_data_cache:
+            LOGGER.debug(f"Raw data cache HIT for key: {raw_cache_key}")
+            cached_item = self._raw_data_cache[raw_cache_key]
+            if file_suffix_lower in [".tif", ".tiff"]:
+                data_to_slice_from, final_axes_order_str_for_slicing = cached_item
+            else:
+                data_to_slice_from = cached_item
+        else:
+            LOGGER.debug(f"Raw data cache MISS for key: {raw_cache_key}. Loading from disk.")
 
-                # --- Refined shape deduction for OME and ImageJ ---
-                intended_nd_shape = None
-                if axes_hint and raw_data_from_tiff.ndim < len(axes_hint):
-                    # OME-TIFF: parse shape from ome_metadata
-                    if (
-                        hasattr(tif, "is_ome") and tif.is_ome
-                    ):  # Check if tifffile identifies it as OME
-                        ome_md = tif.ome_metadata  # This should be a dict
-                        if isinstance(ome_md, dict):  # Ensure it's a dict
-                            image_metadata = ome_md.get("Image")
-                            if isinstance(image_metadata, list):  # OME can have multiple Images
-                                image_metadata = image_metadata[0]  # Assume first image
+            # Temporary variables for data loaded from disk before final processing for cache
+            intermediate_loaded_data: np.ndarray | None = None
 
-                            if isinstance(image_metadata, dict) and "Pixels" in image_metadata:
-                                pixels = image_metadata["Pixels"]
-                                if isinstance(pixels, dict):
-                                    try:
-                                        upper_axes_hint = axes_hint.upper()
-                                        intended_nd_shape = tuple(
-                                            pixels[f"Size{ax}"] for ax in upper_axes_hint
-                                        )
-                                        LOGGER.debug(
-                                            f"OME metadata parsed shape: {intended_nd_shape} "
-                                            f"for axes {axes_hint}"
-                                        )
-                                    except KeyError as e:
-                                        LOGGER.warning(
-                                            f"OME metadata parsing failed for Size{e} "
-                                            f"using axes_hint '{axes_hint}'. Pixels: {pixels}"
-                                        )
-                                        intended_nd_shape = None
-                                    except OSError as e:
-                                        LOGGER.warning(f"Error parsing OME metadata for shape: {e}")
-                                        intended_nd_shape = None
-                        else:
-                            LOGGER.warning(
-                                f"tif.ome_metadata was not a dictionary for {path_to_load}. "
-                                f"Type: {type(ome_md)}"
-                            )
-                    # ImageJ: parse shape from imagej_metadata
-                    elif hasattr(tif, "imagej_metadata") and tif.imagej_metadata:
-                        md = tif.imagej_metadata
+            # --- Load full data from disk ---
+            if file_suffix_lower in [".tif", ".tiff"]:
+                with TiffFile(str(path_to_load)) as tif:
+                    if not tif.series or not tif.series[0] or not tif.series[0].shape:
+                        raise UnknownFileTypeError(
+                            f"Cannot determine series shape for TIFF: {path_to_load}"
+                        )
+                    series = tif.series[0]
+                    raw_data_from_tiff = series.asarray()  # Load ENTIRE series
+
+                    axes_hint = source_cfg.expected_format_hint
+                    shape_hint = source_cfg.expected_shape_hint
+                    series_axes_str = series.axes.upper() if series.axes else ""
+                    # This is the initial interpretation of axes, before permutation
+                    current_axes = (axes_hint.upper() if axes_hint else series_axes_str) or ""
+
+                    current_data_for_processing = raw_data_from_tiff
+
+                    # --- Refined shape deduction (same as original) ---
+                    intended_nd_shape = None
+                    if axes_hint and raw_data_from_tiff.ndim < len(axes_hint):
+                        # OME/ImageJ/shape_hint logic... (copied from original)
+                        if hasattr(tif, "is_ome") and tif.is_ome:
+                            ome_md = tif.ome_metadata
+                            if isinstance(ome_md, dict):
+                                image_metadata = ome_md.get("Image")
+                                if isinstance(image_metadata, list):
+                                    image_metadata = image_metadata[0]
+                                if isinstance(image_metadata, dict) and "Pixels" in image_metadata:
+                                    pixels = image_metadata["Pixels"]
+                                    if isinstance(pixels, dict):
+                                        try:
+                                            intended_nd_shape = tuple(
+                                                pixels[f"Size{ax}"] for ax in axes_hint.upper()
+                                            )
+                                        except (KeyError, OSError) as e:
+                                            LOGGER.warning(
+                                                f"OME metadata shape parsing failed: {e}"
+                                            )
+                            else:
+                                LOGGER.warning(f"tif.ome_metadata not a dict for {path_to_load}")
+                        elif hasattr(tif, "imagej_metadata") and tif.imagej_metadata:
+                            md = tif.imagej_metadata
+                            try:
+                                intended_nd_shape = (
+                                    md.get("frames", 1),
+                                    md.get("channels", 1),
+                                    md.get("slices", 1),
+                                    raw_data_from_tiff.shape[-2],
+                                    raw_data_from_tiff.shape[-1],
+                                )
+                            except OSError:
+                                pass  # intended_nd_shape remains None
+                        elif shape_hint and len(shape_hint) == len(axes_hint):
+                            intended_nd_shape = shape_hint
+
+                    if intended_nd_shape and np.prod(raw_data_from_tiff.shape) == np.prod(
+                        intended_nd_shape
+                    ):
                         try:
-                            intended_nd_shape = (
-                                md.get("frames", 1),
-                                md.get("channels", 1),
-                                md.get("slices", 1),
-                                raw_data_from_tiff.shape[-2],
-                                raw_data_from_tiff.shape[-1],
+                            current_data_for_processing = raw_data_from_tiff.reshape(
+                                intended_nd_shape
                             )
-                        except OSError:
-                            intended_nd_shape = None
-                    # Fallback to shape_hint if provided
-                    elif shape_hint and len(shape_hint) == len(axes_hint):
-                        intended_nd_shape = shape_hint
-
-                # Try to reshape if possible
-                if intended_nd_shape and np.prod(raw_data_from_tiff.shape) == np.prod(
-                    intended_nd_shape
-                ):
-                    try:
-                        current_data_for_processing = raw_data_from_tiff.reshape(intended_nd_shape)
-                        current_axes = axes_hint
-                        LOGGER.info(
-                            f"Reshaped TIFF data to {intended_nd_shape} using metadata and/or"
-                            f"   expected_format_hint '{axes_hint}'"
-                        )
-                    except ValueError as e:
-                        LOGGER.warning(
-                            f"Failed to reshape TIFF data to {intended_nd_shape} for axes "
-                            f"'{axes_hint}': {e}"
-                        )
-                        current_data_for_processing = raw_data_from_tiff
-                        current_axes = series_axes_str
-                elif (
-                    shape_hint
-                    and raw_data_from_tiff.ndim == 3
-                    and len(shape_hint) == len(axes_hint)
-                ):
-                    if np.prod(raw_data_from_tiff.shape) == np.prod(shape_hint):
+                            current_axes = axes_hint  # Update current_axes if reshape based on hint
+                            LOGGER.info(
+                                f"Reshaped TIFF data to {intended_nd_shape} using hint "
+                                f"'{axes_hint}'"
+                            )
+                        except (ValueError, OSError) as e:
+                            LOGGER.warning(
+                                f"Failed to reshape TIFF to {intended_nd_shape} for axes "
+                                f"'{axes_hint}': {e}"
+                            )
+                    elif (
+                        shape_hint
+                        and raw_data_from_tiff.ndim == 3
+                        and len(shape_hint) == len(axes_hint or "")
+                        and np.prod(raw_data_from_tiff.shape) == np.prod(shape_hint)
+                    ):
                         try:
                             current_data_for_processing = raw_data_from_tiff.reshape(shape_hint)
                             current_axes = axes_hint
                             LOGGER.info(
-                                f"Reshaped TIFF data to {shape_hint} using expected_shape_hint and"
-                                f"   expected_format_hint '{axes_hint}'"
+                                f"Reshaped 3D TIFF data to {shape_hint} using shape_hint and "
+                                f"format_hint '{axes_hint}'"
                             )
                         except OSError as e:
-                            LOGGER.warning(
-                                f"Failed to reshape TIFF data to {shape_hint} "
-                                f"for axes '{axes_hint}': {e}"
-                            )
+                            LOGGER.warning(f"Failed to reshape 3D TIFF data: {e}")
 
-                permuted_data = current_data_for_processing
-                final_axes_order_str = current_axes
+                    # --- Permutation logic (copied & adapted from original) ---
+                    permuted_data = current_data_for_processing
+                    # final_axes_order_str_for_slicing will be the axes string *after* permutation
+                    final_axes_order_str_for_slicing = current_axes
 
-                # Standard internal target orders
-                # 5D: TCDHW
-                # 4D: CDHW
-                # 3D: DHW
+                    final_ndim = permuted_data.ndim
+                    if current_axes and final_ndim > 0:
+                        if final_ndim == 4 and current_axes == "TZYX":
+                            permuted_data = permuted_data[:, np.newaxis, :, :, :]
+                            final_axes_order_str_for_slicing = "TCDHW"
+                        elif final_ndim == 5:
+                            if current_axes == "TCZYX":
+                                final_axes_order_str_for_slicing = "TCDHW"
+                            elif current_axes == "TZCYX":
+                                permuted_data = np.transpose(permuted_data, (0, 2, 1, 3, 4))
+                                final_axes_order_str_for_slicing = "TCDHW"
+                        else:
+                            permutation_map = {
+                                "ZYX": ((0, 1, 2), "DHW"),
+                                "YXZ": ((1, 0, 2), "DHW"),
+                                "XYZ": ((2, 0, 1), "DHW"),
+                                "QYX": ((0, 1, 2), "DHW"),
+                                "IYX": ((0, 1, 2), "DHW"),
+                                "CZYX": ((0, 1, 2, 3), "CDHW"),
+                                "ZCYX": ((1, 0, 2, 3), "CDHW"),
+                                "CZXY": ((0, 1, 3, 2), "CDHW"),
+                                "TZYX": (
+                                    (0, 1, 2, 3),
+                                    "CDHW",
+                                ),  # Fallback if not 4D TZYX handled above
+                                "TCZYX": ((0, 1, 2, 3, 4), "TCDHW"),
+                                "TZCYX": ((0, 2, 1, 3, 4), "TCDHW"),
+                            }
+                            if current_axes in permutation_map:
+                                perm_indices, target_axes = permutation_map[current_axes]
+                                if len(perm_indices) == permuted_data.ndim:
+                                    try:
+                                        permuted_data = np.transpose(permuted_data, perm_indices)
+                                        final_axes_order_str_for_slicing = target_axes
+                                    except ValueError as e:
+                                        LOGGER.error(
+                                            f"Permutation from '{current_axes}' failed: {e}"
+                                        )
+                                # else: final_axes_order_str_for_slicing remains current_axes
+                    elif not current_axes and permuted_data.ndim > 0:  # No axes info
+                        if permuted_data.ndim == 5:
+                            final_axes_order_str_for_slicing = "TCDHW"
+                        elif permuted_data.ndim == 4:
+                            final_axes_order_str_for_slicing = "CDHW"
+                        elif permuted_data.ndim == 3:
+                            final_axes_order_str_for_slicing = "DHW"
+                        else:
+                            final_axes_order_str_for_slicing = "?" * permuted_data.ndim
 
-                # --- Begin new permutation logic for TZYX and 5D cases ---
-                final_ndim = raw_data_from_tiff.ndim
-                if axes_from_tiff and final_ndim > 0:
-                    if final_ndim == 4 and axes_from_tiff == "TZYX":
-                        # Input is (T,Z,Y,X). Expand to (T,1,Z,Y,X) for BasePatchDataset 5D path.
-                        # This makes C_eff=1, D_eff=Z. total_time_frames will be T.
-                        permuted_data = raw_data_from_tiff[:, np.newaxis, :, :, :]
-                        final_axes_order_str = "TCDHW"  # Semantic meaning after expand_dims
-                        LOGGER.info(
-                            f"Interpreted TZYX as T(1)ZYX (TCDHW semantically). "
-                            f"New shape: {permuted_data.shape}"
+                    intermediate_loaded_data = permuted_data
+                    # `final_axes_order_str_for_slicing` is now set
+
+            elif file_suffix_lower in [".h5", ".hdf5"]:
+                with h5py.File(str(path_to_load), "r") as f:
+                    dataset_name = source_cfg.expected_format_hint or next(iter(f.keys()), None)
+                    if not dataset_name or dataset_name not in f:
+                        raise InvalidHDF5DatasetError(
+                            f"HDF5: Dataset '{dataset_name}' not found in {path_to_load}"
                         )
-                    elif final_ndim == 5:
-                        if axes_from_tiff == "TCZYX":
-                            permuted_data = raw_data_from_tiff
-                            final_axes_order_str = "TCDHW"
-                        elif axes_from_tiff == "TZCYX":
-                            permuted_data = np.transpose(raw_data_from_tiff, (0, 2, 1, 3, 4))
-                            final_axes_order_str = "TCDHW"
-                        else:
-                            LOGGER.warning(f"Unknown 5D axes '{axes_from_tiff}'. Using raw order.")
-                            final_axes_order_str = axes_from_tiff
-                    else:
-                        # Fallback to original permutation map for other cases
-                        permutation_map = {
-                            # Target: DHW (3D)
-                            "ZYX": ((0, 1, 2), "DHW"),  # No change
-                            "YXZ": ((1, 0, 2), "DHW"),
-                            "XYZ": ((2, 0, 1), "DHW"),
-                            "QYX": ((0, 1, 2), "DHW"),
-                            "IYX": ((0, 1, 2), "DHW"),
-                            "CZYX": ((0, 1, 2, 3), "CDHW"),
-                            "ZCYX": ((1, 0, 2, 3), "CDHW"),
-                            "CZXY": ((0, 1, 3, 2), "CDHW"),
-                            "TZYX": ((0, 1, 2, 3), "CDHW"),  # If not handled above
-                            # Target: TCDHW (5D)
-                            "TCZYX": ((0, 1, 2, 3, 4), "TCDHW"),
-                            "TZCYX": ((0, 2, 1, 3, 4), "TCDHW"),
-                        }
-                        if axes_from_tiff in permutation_map:
-                            perm_indices, target_axes = permutation_map[axes_from_tiff]
-                            if len(perm_indices) == raw_data_from_tiff.ndim:
-                                try:
-                                    permuted_data = np.transpose(raw_data_from_tiff, perm_indices)
-                                    final_axes_order_str = target_axes
-                                    LOGGER.info(
-                                        f"Permuted '{axes_from_tiff}' to '{final_axes_order_str}', "
-                                        f"new_shape={permuted_data.shape}"
-                                    )
-                                except ValueError as e:
-                                    LOGGER.error(
-                                        f"Permutation from '{axes_from_tiff}' failed: {e}. "
-                                        f"Using raw order."
-                                    )
-                                    final_axes_order_str = axes_from_tiff  # Revert
-                            else:
-                                LOGGER.warning(
-                                    f"Permutation map for '{axes_from_tiff}' has incorrect ndim. "
-                                    f"Using raw order."
-                                )
-                                final_axes_order_str = axes_from_tiff
-                        else:
-                            LOGGER.warning(
-                                f"TIFF {path_to_load} has axes '{axes_from_tiff}' "
-                                f"not in explicit permutation map. Using raw data order."
-                            )
-                            # permuted_data is already raw_data_from_tiff
-                elif not axes_from_tiff and raw_data_from_tiff.ndim > 0:  # No axes info at all
-                    LOGGER.warning(
-                        f"TIFF {path_to_load} has no axes metadata. "
-                        f"Interpreting based on ndim {raw_data_from_tiff.shape} as default."
-                    )
+                    dataset = f.get(dataset_name)
+                    if not isinstance(dataset, h5py.Dataset):
+                        raise InvalidHDF5DatasetError(
+                            f"HDF5: Key '{dataset_name}' is not a Dataset in {path_to_load}"
+                        )
+                    intermediate_loaded_data = dataset[:]  # Load ENTIRE dataset
+                # final_axes_order_str_for_slicing remains None for HDF5
 
-                    if raw_data_from_tiff.ndim == 5:
-                        final_axes_order_str = "TCDHW"
-                    elif raw_data_from_tiff.ndim == 4:
-                        final_axes_order_str = "CDHW"
-                    elif raw_data_from_tiff.ndim == 3:
-                        final_axes_order_str = "DHW"
-                    else:
-                        final_axes_order_str = "?" * raw_data_from_tiff.ndim
-                    # permuted_data is already raw_data_from_tiff
+            elif method:
+                intermediate_loaded_data = method(path_to_load)
+
+            else:
+                raise UnknownFileTypeError(path_to_load)
+
+            if intermediate_loaded_data is None:
+                raise RuntimeError(f"Full data loading resulted in None for {path_to_load}")
+
+            # Process for caching: convert to float32 and ensure C-contiguity
+            data_to_slice_from = np.ascontiguousarray(intermediate_loaded_data.astype(np.float32))
+
+            # Store in cache
+            if file_suffix_lower in [".tif", ".tiff"]:
+                self._raw_data_cache[raw_cache_key] = (
+                    data_to_slice_from,
+                    final_axes_order_str_for_slicing,
+                )
+            else:  # HDF5, custom
+                self._raw_data_cache[raw_cache_key] = data_to_slice_from
+
+        # --- Slicing Logic (applied to `data_to_slice_from`) ---
+        begin_slice_user, end_slice_user = source_cfg.begin_slice, source_cfg.end_slice
+        slicing_dim_idx = 0  # Default: slice along the first dimension
+
+        if data_to_slice_from.ndim == 0:  # Should be caught earlier but good check
+            raise UnknownFileTypeError(f"Data to slice is a scalar for {path_to_load}")
+
+        # Determine slicing_dim_idx based on slice_dimension_name
+        if source_cfg.slice_dimension_name:
+            if file_suffix_lower in [".tif", ".tiff"] and source_cfg.expected_format_hint:
+                original_hint_axes = source_cfg.expected_format_hint.upper()
+                user_slice_dim_char = source_cfg.slice_dimension_name.upper()
+                try:
+                    slicing_dim_idx = original_hint_axes.index(user_slice_dim_char)
                     LOGGER.info(
-                        f"Guessed axes '{final_axes_order_str}' for shape {permuted_data.shape}"
+                        f"TIFF: Slicing on user dimension '{user_slice_dim_char}' "
+                        f"(index {slicing_dim_idx} from hint '{original_hint_axes}') "
+                        f"for data with final axes '{final_axes_order_str_for_slicing}'."
                     )
-
-                # --- Slicing ---
-                data_to_slice = permuted_data
-                slicing_dim_idx = 0  # Default: slice along the first dimension
-
-                if (
-                    source_cfg.slice_dimension_name
-                    and final_axes_order_str
-                    and "?" not in final_axes_order_str
-                ):
-                    user_slice_dim_name = source_cfg.slice_dimension_name.upper()
-
-                    if user_slice_dim_name in axes_from_tiff:
+                except ValueError:
+                    LOGGER.warning(
+                        f"TIFF: slice_dimension_name '{user_slice_dim_char}' not found in "
+                        f"expected_format_hint '{original_hint_axes}'. "
+                        "Attempting search in final axes."
+                    )
+                    if (
+                        final_axes_order_str_for_slicing
+                        and "?" not in final_axes_order_str_for_slicing
+                    ):
                         try:
-                            original_semantic_idx = axes_from_tiff.index(user_slice_dim_name)
-
-                            if original_semantic_idx < len(final_axes_order_str):
-                                target_slice_char_in_permuted_axes = final_axes_order_str[
-                                    original_semantic_idx
-                                ]
-                                slicing_dim_idx = final_axes_order_str.index(
-                                    target_slice_char_in_permuted_axes
-                                )
-                                LOGGER.info(
-                                    f"Slicing on user dimension '{user_slice_dim_name}'"
-                                    f"(original index {original_semantic_idx}), "
-                                    f"which corresponds to '{target_slice_char_in_permuted_axes}'"
-                                    f"(index {slicing_dim_idx}) in permuted axes "
-                                    f"'{final_axes_order_str}'."
-                                )
-                            else:
-                                LOGGER.warning(
-                                    f"Original index for slice dimension '{user_slice_dim_name}' "
-                                    f"is out of bounds for permuted axes '{final_axes_order_str}'. "
-                                    f"Slicing on dim 0."
-                                )
+                            slicing_dim_idx = final_axes_order_str_for_slicing.index(
+                                user_slice_dim_char
+                            )
+                            LOGGER.info(
+                                f"TIFF: Slicing on user dimension '{user_slice_dim_char}' "
+                                f"(index {slicing_dim_idx}) found in final axes "
+                                f"'{final_axes_order_str_for_slicing}'."
+                            )
                         except ValueError:
                             LOGGER.warning(
-                                f"Could not determine slice index for dimension "
-                                f"'{user_slice_dim_name}' using axes '{axes_from_tiff}' "
-                                f"and permuted axes '{final_axes_order_str}'. "
-                                f"Slicing on dim 0."
+                                f"TIFF: slice_dimension_name '{user_slice_dim_char}' "
+                                f"not found in final axes '{final_axes_order_str_for_slicing}'. "
+                                "Slicing on dim 0."
                             )
+                            slicing_dim_idx = 0
                     else:
                         LOGGER.warning(
-                            f"User-specified slice_dimension_name '{user_slice_dim_name}' "
-                            f"not found in derived initial axes '{axes_from_tiff}'. "
-                            f"Slicing on dim 0."
-                        )
-
-                if data_to_slice.ndim == 0:  # Should not happen for image data
-                    raise UnknownFileTypeError(f"TIFF data resulted in a scalar for {path_to_load}")
-                if slicing_dim_idx >= data_to_slice.ndim:
-                    raise ConfigError(
-                        f"Slicing dimension index {slicing_dim_idx} "
-                        f"out of bounds for data ndim {data_to_slice.ndim}"
-                    )
-
-                num_elements_in_slice_dim = data_to_slice.shape[slicing_dim_idx]
-
-                actual_begin_slice = begin_slice_user
-                actual_end_slice = (
-                    num_elements_in_slice_dim if end_slice_user == -1 else end_slice_user
-                )
-
-                if not (
-                    0 <= actual_begin_slice < num_elements_in_slice_dim
-                    and actual_begin_slice < actual_end_slice <= num_elements_in_slice_dim
-                ):
-                    raise InvalidSliceRangeError(
-                        f"{path_to_load} (axes: {final_axes_order_str}, "
-                        f"shape: {data_to_slice.shape}, "
-                        f"slicing_dim_idx: {slicing_dim_idx})",
-                        actual_begin_slice,
-                        actual_end_slice,
-                    )
-
-                # Create slice object for the specified dimension
-                slice_obj = [slice(None)] * data_to_slice.ndim
-                slice_obj[slicing_dim_idx] = slice(actual_begin_slice, actual_end_slice)
-                data = data_to_slice[tuple(slice_obj)]
-
-                LOGGER.debug(
-                    f"Sliced on dim_idx {slicing_dim_idx} "
-                    f"('{final_axes_order_str[slicing_dim_idx]}' if axes known) "
-                    f"from {actual_begin_slice} to {actual_end_slice}. "
-                    f"Final data shape: {data.shape}"
-                )
-
-        elif path_to_load.suffix.lower() in [".h5", ".hdf5"]:
-            with h5py.File(str(path_to_load), "r") as f:
-                # Allow specifying dataset name, default to first key
-                dataset_name_to_load = source_cfg.expected_format_hint or next(iter(f.keys()))
-                if not dataset_name_to_load or dataset_name_to_load not in f:
-                    raise InvalidHDF5DatasetError(
-                        f"HDF5 file {path_to_load} has no dataset named "
-                        f"'{dataset_name_to_load}' or no datasets at all."
-                    )
-
-                dataset = f.get(dataset_name_to_load)
-                if not isinstance(dataset, h5py.Dataset):
-                    raise InvalidHDF5DatasetError(
-                        f"HDF5 key '{dataset_name_to_load}' in {path_to_load} is not a Dataset."
-                    )
-
-                # HDF5 slicing: Assume slice_dimension_name refers to index if provided, else 0
-                slicing_dim_idx = 0
-                if source_cfg.slice_dimension_name:
-                    try:
-                        slicing_dim_idx = int(
-                            source_cfg.slice_dimension_name
-                        )  # Allow int string for dim index
-                        if not (0 <= slicing_dim_idx < dataset.ndim):
-                            raise ValueError("Index out of bounds")
-                    except ValueError:
-                        LOGGER.warning(
-                            f"HDF5 slice_dimension_name '{source_cfg.slice_dimension_name}' "
-                            f"is not a valid integer index. Slicing on dim 0."
+                            f"TIFF: Cannot use slice_dimension_name '{user_slice_dim_char}' "
+                            f"as final axes unknown or unusable. Slicing on dim 0."
                         )
                         slicing_dim_idx = 0
-
-                num_elements_in_slice_dim = dataset.shape[slicing_dim_idx]
-                actual_begin_slice = begin_slice_user
-                actual_end_slice = (
-                    num_elements_in_slice_dim if end_slice_user == -1 else end_slice_user
-                )
-
-                if not (
-                    0 <= actual_begin_slice < num_elements_in_slice_dim
-                    and actual_begin_slice < actual_end_slice <= num_elements_in_slice_dim
-                ):
-                    raise InvalidSliceRangeError(
-                        f"{path_to_load} (HDF5 dataset '{dataset_name_to_load}' "
-                        f"shape: {dataset.shape}, slicing_dim_idx: {slicing_dim_idx})",
-                        actual_begin_slice,
-                        actual_end_slice,
+            elif file_suffix_lower in [".h5", ".hdf5"]:  # HDF5 or custom (if name is int)
+                try:
+                    slicing_dim_idx = int(source_cfg.slice_dimension_name)
+                    if not (0 <= slicing_dim_idx < data_to_slice_from.ndim):
+                        LOGGER.warning(
+                            f"HDF5/Custom: slice_dimension_name index "
+                            f"{slicing_dim_idx} out of bounds "
+                            f"for ndim {data_to_slice_from.ndim}. Slicing on dim 0."
+                        )
+                        slicing_dim_idx = 0
+                except ValueError:
+                    LOGGER.warning(
+                        f"HDF5/Custom: slice_dimension_name '{source_cfg.slice_dimension_name}' "
+                        f"is not a valid integer index. Slicing on dim 0."
                     )
+                    slicing_dim_idx = 0
+            # else custom method without integer slice_dimension_name also defaults to 0
 
-                slice_obj = [slice(None)] * dataset.ndim
-                slice_obj[slicing_dim_idx] = slice(actual_begin_slice, actual_end_slice)
-                data = np.array(dataset[tuple(slice_obj)])
-                LOGGER.debug(
-                    f"HDF5: Sliced dataset '{dataset_name_to_load}' on dim {slicing_dim_idx} "
-                    f"from {actual_begin_slice} to {actual_end_slice}. "
-                    f"Final shape: {data.shape}"
-                )
+        if not (0 <= slicing_dim_idx < data_to_slice_from.ndim):  # Final safety check
+            raise ConfigError(
+                f"Slicing dimension index {slicing_dim_idx} "
+                f"out of bounds for data ndim {data_to_slice_from.ndim}"
+            )
 
-        elif method:
-            data = method(path_to_load, begin=begin_slice_user, end=end_slice_user)
-        else:
-            raise UnknownFileTypeError(path_to_load)
+        num_elements_in_slice_dim = data_to_slice_from.shape[slicing_dim_idx]
+        actual_begin_slice = begin_slice_user
+        actual_end_slice = num_elements_in_slice_dim if end_slice_user == -1 else end_slice_user
 
-        if data is None:  # Should be caught by earlier specific errors
-            raise RuntimeError(f"Data loading resulted in None for {path_to_load}")
+        if not (
+            0 <= actual_begin_slice < num_elements_in_slice_dim
+            and actual_begin_slice < actual_end_slice <= num_elements_in_slice_dim
+        ):
+            current_axes_for_error = (
+                final_axes_order_str_for_slicing if final_axes_order_str_for_slicing else "N/A"
+            )
+            raise InvalidSliceRangeError(
+                f"{path_to_load} (shape: {data_to_slice_from.shape}, "
+                f"slicing_dim_idx: {slicing_dim_idx}, axes: '{current_axes_for_error}')",
+                actual_begin_slice,
+                actual_end_slice,
+            )
 
-        return data.astype(np.float32)
+        slice_obj_list = [slice(None)] * data_to_slice_from.ndim
+        slice_obj_list[slicing_dim_idx] = slice(actual_begin_slice, actual_end_slice)
+
+        sliced_data = data_to_slice_from[tuple(slice_obj_list)]
+
+        # Ensure the final returned array is C-contiguous
+        final_data = np.ascontiguousarray(sliced_data)  # data_to_slice_from was already float32
+
+        s_dim_char = "?"
+        if final_axes_order_str_for_slicing and slicing_dim_idx < len(
+            final_axes_order_str_for_slicing
+        ):
+            s_dim_char = final_axes_order_str_for_slicing[slicing_dim_idx]
+
+        LOGGER.debug(
+            f"Sliced on dim_idx {slicing_dim_idx} ('{s_dim_char}') "
+            f"from {actual_begin_slice} to {actual_end_slice}. "
+            f"Original full shape: {data_to_slice_from.shape}, "
+            f"Final sliced shape: {final_data.shape}, Contiguous: {final_data.flags.c_contiguous}"
+        )
+        return final_data
 
     def load_data_only(self, method: Callable | None = None) -> SSUnetData:
         data_arr = self._load_from_source(self.data, method)
-        if data_arr is None:  # Should only happen if data source itself is None/unavailable
-            raise NoDataFileAvailableError(
-                "Primary data file could not be loaded (source config issue or loading failed)."
-            )
+        if data_arr is None:
+            raise NoDataFileAvailableError("Primary data file could not be loaded.")
         return SSUnetData(primary_data=data_arr)
 
     def load_reference_only(self, method: Callable | None = None) -> SSUnetData:
-        # Check if reference is configured and available
         if not self.reference or not self.reference.is_available:
-            LOGGER.info(
-                "Reference not configured/available, attempting to load primary data "
-                "for load_reference_only."
-            )
-            return self.load_data_only(method)  # Fallback to primary data
-
+            LOGGER.info("Reference not configured/available, loading primary data instead.")
+            return self.load_data_only(method)
         ref_arr = self._load_from_source(self.reference, method)
-        if ref_arr is None:  # Loading explicitly configured reference failed
-            LOGGER.warning(
-                "Configured reference file could not be loaded. Falling back to primary data."
-            )
+        if ref_arr is None:
+            LOGGER.warning("Configured reference file load failed. Falling back to primary data.")
             return self.load_data_only(method)
         return SSUnetData(primary_data=ref_arr)
 
@@ -568,117 +522,53 @@ class PathConfig:
         if data_arr is None:
             raise NoDataFileAvailableError("Primary data file could not be loaded.")
 
-        # Try to load ground_truth first
         gt_arr = self._load_from_source(self.ground_truth, method)
-
         if gt_arr is None and self.reference and self.reference.is_available:
-            LOGGER.info("Ground truth not available/loaded, attempting to load reference instead.")
+            LOGGER.info("Ground truth not available/loaded, trying reference.")
             gt_arr = self._load_from_source(self.reference, method)
 
-        if gt_arr is None:  # If both GT and Ref failed or were not available
+        if gt_arr is None:
             LOGGER.warning(
-                "Neither ground truth nor reference data available/loaded for "
-                "load_data_and_ground_truth. Secondary data will be None."
+                "Neither ground truth nor reference available/loaded. Secondary data is None."
             )
-            # could raise error or return SSUnetData with secondary_data=None
 
         normalized_gt_arr = self._normalize_ground_truth(gt_arr) if gt_arr is not None else None
         return SSUnetData(primary_data=data_arr, secondary_data=normalized_gt_arr)
 
     def load_reference_and_ground_truth(self, method: Callable | None = None) -> SSUnetData:
-        # Load reference; if not available or fails, try primary data as reference
         ref_arr = self._load_from_source(self.reference, method)
         if ref_arr is None:
-            LOGGER.info(
-                "Reference not available/loaded, attempting to load primary data as reference."
-            )
+            LOGGER.info("Reference not available/loaded, trying primary data as reference.")
             ref_arr = self._load_from_source(self.data, method)
-            if ref_arr is None:  # If primary data also fails
+            if ref_arr is None:
                 raise NoDataFileAvailableError(
                     "Neither reference nor primary data could be loaded."
                 )
 
-        # Load ground_truth; if not available or fails, use the loaded ref_arr (primary data)
         gt_arr = self._load_from_source(self.ground_truth, method)
         if gt_arr is None:
             LOGGER.info(
-                "Ground truth not available/loaded, using the loaded reference/primary data "
-                "as ground truth."
+                "Ground truth not available/loaded, using loaded reference/primary as ground truth."
             )
-            gt_arr = ref_arr  # ref_arr is guaranteed to be non-None here
+            gt_arr = ref_arr  # ref_arr is guaranteed non-None here
 
-        normalized_gt_arr = self._normalize_ground_truth(gt_arr)  # gt_arr is non-None
+        normalized_gt_arr = self._normalize_ground_truth(gt_arr)  # gt_arr non-None
         return SSUnetData(primary_data=ref_arr, secondary_data=normalized_gt_arr)
 
     def _normalize_ground_truth(self, ground_truth: np.ndarray | None) -> np.ndarray | None:
         if ground_truth is None:
             return None
-
-        # Ensure it's float for calculations
-        gt_float = ground_truth.astype(np.float32)
+        gt_float = ground_truth.astype(np.float32)  # Already float32 from _load_from_source
         gt_min, gt_max = np.min(gt_float), np.max(gt_float)
 
-        if gt_max == gt_min:  # Constant image
-            # If constant is 0, return 0. Otherwise, maybe 0.5 or 1.
-            # Or just return as is if normalization is not well-defined.
-            LOGGER.debug("Ground truth is a constant image. Returning as is.")
+        if abs(gt_max - gt_min) < EPSILON:
+            LOGGER.debug("Ground truth is constant. Returning as is.")
             return gt_float
-
-        # Heuristic for 8-bit like data (0-255 range)
         if 1.0 < gt_max <= 255.0 and gt_min >= 0:
-            LOGGER.debug("Normalizing ground truth from approx 8-bit range to [0,1].")
-            return (gt_float - gt_min) / (gt_max - gt_min + EPSILON)  # Normalize to 0-1 robustly
-
-        # Heuristic for 16-bit like data or other large ranges
+            LOGGER.debug("Normalizing ground truth (approx 8-bit) to [0,1].")
+            return (gt_float - gt_min) / (gt_max - gt_min + EPSILON)
         elif gt_max > 255.0 and gt_min >= 0:
-            LOGGER.debug("Normalizing ground truth from >8-bit range to [0,1] by its own min/max.")
-            return (gt_float - gt_min) / (gt_max - gt_min + EPSILON)  # Normalize to 0-1 robustly
-
-        # If already in ~[0,1] range or negative values present, return as is
-        # (or apply a different normalization if needed for negative values)
-        LOGGER.debug(
-            "Ground truth appears to be already in [0,1] range or contains negative values. "
-            "Returning as is."
-        )
+            LOGGER.debug("Normalizing ground truth (>8-bit) to [0,1].")
+            return (gt_float - gt_min) / (gt_max - gt_min + EPSILON)
+        LOGGER.debug("Ground truth in [0,1] or has negatives. Returning as is.")
         return gt_float
-
-
-# inspect_tiff_dimensions can remain as a utility if needed for manual inspection
-# but PathConfig now handles common cases internally.
-
-
-@dataclass
-class SplitParams:
-    method: str = "signal"
-    min_p: float = EPSILON
-    max_p: float = 1.0 - EPSILON  # Ensure this is less than 1.0
-    p_list: list[float] | None = field(default_factory=list)
-    normalize_target: bool = True
-    seed: int | None = None
-
-    def __post_init__(self) -> None:
-        valid_methods = ["signal", "fixed", "list"]
-        if self.method not in valid_methods:
-            raise ConfigError(  # Use imported ConfigError
-                f"Invalid SPLIT.method '{self.method}'. Must be one of {valid_methods}."
-            )
-        if self.method == "signal":
-            if not (
-                0.0 <= self.min_p < self.max_p <= 1.0
-            ):  # p values for signal should be in [0,1]
-                # Allow min_p == max_p for signal if user wants fixed p via signal method
-                if self.min_p == self.max_p and 0.0 <= self.min_p <= 1.0:
-                    pass
-                else:
-                    raise ConfigError(
-                        f"For 'signal' method, "
-                        f"0.0 <= min_p ({self.min_p}) < max_p ({self.max_p}) <= 1.0 "
-                        "must hold."
-                    )
-        elif self.method == "list" and self.p_list:
-            for p_val in self.p_list:
-                if not (0.0 < p_val < 1.0):  # p values in list should be (0,1) for binomial prob
-                    raise ConfigError(
-                        f"p_list values must be between 0 and 1 (exclusive), got {p_val}"
-                    )
-        # seed is handled by the class using it (e.g. BinomDataset)

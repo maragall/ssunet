@@ -1,0 +1,1414 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/ssunet/modules
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/ssunet/modules/__init__.py
+src/ssunet/modules/blocks.py
+src/ssunet/modules/layers.py
+src/ssunet/modules/normalization.py
+src/ssunet/modules/special_layers.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/ssunet/modules/blocks.py">
+"""U-Net building blocks for 3D medical image processing."""
+
+from functools import partial
+
+import torch
+from torch import nn
+
+from .layers import (
+    ConvNeXtBlock3D,
+    activation_function,
+    conv111,
+    conv333,
+    merge,
+    merge_conv,
+    pool,
+    upconv222,
+)
+from .normalization import LayerNorm3D, get_norm_layer
+
+"""U-Net building blocks for 3D medical image processing."""
+
+
+# Base class for all blocks
+class BaseUnetBlock3D(nn.Module):
+    """Base class for modern U-Net blocks with proven improvements."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        skip_out: bool = True,
+        dropout_p: float = 0.0,
+        down_mode: str = "maxpool",
+        up_mode: str = "transpose",
+        merge_mode: str = "concat",
+        use_attention: bool = False,
+        z_conv: bool = True,
+        activation: str = "gelu",  # Added activation parameter
+        **kwargs: dict,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.skip_out = skip_out
+        self.dropout_p = dropout_p
+        self.up_mode = up_mode
+        self.merge_mode = merge_mode  # Stored for use in child classes
+        self.use_attention = use_attention
+        self.z_conv = z_conv
+        self.activation_name = activation  # Store activation name
+        self.kwargs = kwargs
+
+        # Core components
+        self.dropout = nn.Dropout3d(p=dropout_p) if dropout_p > 0 else nn.Identity()
+
+        # Use the activation_function factory from layers.py
+        self.activation = activation_function(activation, **kwargs.get("activation_kwargs", {}))
+
+        # Setup operation functions to avoid lambda serialization issues
+        self._setup_operations(down_mode, up_mode, self.merge_mode)
+
+        self._build_layers()  # Define layers first
+        self.apply(
+            self._init_weights
+        )  # Then initialize all weights including those in _build_layers
+
+    def _setup_operations(self, down_mode: str, up_mode: str, merge_mode_arg: str):
+        """Setup operation functions to avoid lambda serialization issues."""
+        self.merge = partial(merge, merge_mode=merge_mode_arg)
+        self.merge_conv = partial(merge_conv, z_conv=self.z_conv, mode=merge_mode_arg)
+        self.down_sample = partial(pool, down_mode=down_mode, z_conv=self.z_conv, last=False)
+        self.up_sample = upconv222(self.in_channels, self.out_channels, self.z_conv, up_mode)
+
+    def _build_layers(self):
+        """Define the specific layers for this block."""
+        raise NotImplementedError
+
+    def _init_weights(self, module):
+        """Initialize weights using He initialization."""
+        if isinstance(module, nn.Conv3d | nn.ConvTranspose3d):
+            # Adjust initialization based on activation
+            if self.activation_name.lower() in ["relu", "leaky"]:
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif self.activation_name.lower() in ["silu", "gelu"]:
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            else:
+                nn.init.xavier_normal_(module.weight)
+
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Linear):
+            if self.activation_name.lower() in ["relu", "leaky"]:
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            else:
+                nn.init.xavier_normal_(module.weight)
+
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+
+# Encoder blocks
+class EfficientDownBlock3D(BaseUnetBlock3D):
+    """Efficient downsampling block with residual connection."""
+
+    def _build_layers(self):
+        self.residual = conv111(self.in_channels, self.out_channels)
+        self.conv1 = conv333(self.in_channels, self.out_channels, z_conv=self.z_conv)
+        self.norm1 = LayerNorm3D(self.out_channels)
+        self.conv2 = conv333(self.out_channels, self.out_channels, z_conv=self.z_conv)
+        self.norm2 = LayerNorm3D(self.out_channels)
+        self.pool = self.down_sample(self.out_channels, self.out_channels)  # type: ignore
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        residual = self.residual(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.activation(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.activation(out)
+        out = out + residual
+        before_pool = self.dropout(out)
+        pooled = self.pool(before_pool)
+        return (pooled, before_pool) if self.skip_out else (pooled, None)
+
+
+class ConvNeXtDownBlock3D(BaseUnetBlock3D):
+    """State-of-the-art downsampling block using ConvNeXt design."""
+
+    def _build_layers(self):
+        num_blocks = self.kwargs.get("num_blocks", 2)
+        expand_ratio = self.kwargs.get("expand_ratio", 4)
+        kernel_size = self.kwargs.get("kernel_size", 7)
+
+        self.proj = nn.Identity()
+        if self.in_channels != self.out_channels:
+            self.proj = nn.Conv3d(self.in_channels, self.out_channels, kernel_size=1)
+
+        self.blocks = nn.ModuleList(
+            [
+                ConvNeXtBlock3D(
+                    self.out_channels,
+                    expand_ratio=expand_ratio,
+                    kernel_size=kernel_size,
+                    z_conv=self.z_conv,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.pool = self.down_sample(self.out_channels, self.out_channels)  # type: ignore
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x = self.proj(x)
+        for block_module in self.blocks:
+            x = block_module(x)
+        before_pool = self.dropout(x)
+        pooled = self.pool(before_pool)
+        return (pooled, before_pool) if self.skip_out else (pooled, None)
+
+
+# NAFNet blocks
+class SimpleGate3D(nn.Module):
+    """3D Simple Gate mechanism from NAFNet."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class NAFBlock3D(nn.Module):
+    """3D NAFNet block with depthwise convolution and channel attention."""
+
+    def __init__(
+        self,
+        channels: int,
+        dw_expand: int = 2,
+        ffn_expand: int = 2,
+        dropout_p: float = 0.0,
+        z_conv: bool = True,
+    ):
+        super().__init__()
+        dw_channels = channels * dw_expand
+
+        # Spatial mixing path
+        self.conv1 = conv111(channels, dw_channels)
+
+        # Depthwise convolution
+        kernel = 3 if z_conv else (1, 3, 3)
+        padding = 1 if z_conv else (0, 1, 1)
+        self.conv2 = nn.Conv3d(
+            dw_channels,
+            dw_channels,
+            kernel_size=kernel,
+            stride=1,
+            padding=padding,
+            groups=dw_channels,
+            bias=True,
+        )
+
+        # Channel attention
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(dw_channels // 2, dw_channels // 2, kernel_size=1, bias=True),
+        )
+
+        self.conv3 = conv111(dw_channels // 2, channels)
+
+        # FFN path
+        ffn_channels = channels * ffn_expand
+        self.conv4 = conv111(channels, ffn_channels)
+        self.conv5 = conv111(ffn_channels // 2, channels)
+
+        # Gates - NAFNet always uses SimpleGate
+        self.sg1 = SimpleGate3D()
+        self.sg2 = SimpleGate3D()
+
+        # Normalization
+        self.norm1 = LayerNorm3D(channels)
+        self.norm2 = LayerNorm3D(channels)
+
+        # Dropout
+        self.dropout1 = nn.Dropout3d(dropout_p) if dropout_p > 0 else nn.Identity()
+        self.dropout2 = nn.Dropout3d(dropout_p) if dropout_p > 0 else nn.Identity()
+
+        # Learnable scaling parameters
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        # Spatial mixing branch
+        out = self.norm1(x)
+        out = self.conv1(out)
+        out = self.conv2(out)
+        out = self.sg1(out)  # SimpleGate splits channels
+
+        # Channel attention
+        sca_out = self.sca(out)
+        out = out * sca_out
+        out = self.conv3(out)
+        out = self.dropout1(out)
+
+        # First residual connection
+        x = identity + out * self.beta
+
+        # Channel mixing branch (FFN)
+        identity = x
+        out = self.norm2(x)
+        out = self.conv4(out)
+        out = self.sg2(out)
+        out = self.conv5(out)
+        out = self.dropout2(out)
+
+        # Second residual connection
+        return identity + out * self.gamma
+
+
+class NAFDownBlock3D(BaseUnetBlock3D):
+    """NAFNet-inspired downsampling block for 3D data."""
+
+    def _build_layers(self):
+        num_blocks = self.kwargs.get("num_blocks", 2)
+        dw_expand = self.kwargs.get("dw_expand", 2)
+        ffn_expand = self.kwargs.get("ffn_expand", 2)
+
+        # Initial projection if needed
+        self.proj = nn.Identity()
+        if self.in_channels != self.out_channels:
+            self.proj = conv111(self.in_channels, self.out_channels)
+
+        # NAF blocks - note: NAFBlock3D doesn't use the activation parameter
+        self.blocks = nn.ModuleList(
+            [
+                NAFBlock3D(
+                    self.out_channels,
+                    dw_expand=dw_expand,
+                    ffn_expand=ffn_expand,
+                    dropout_p=self.dropout_p,
+                    z_conv=self.z_conv,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+        # Downsampling
+        self.pool = self.down_sample(self.out_channels, self.out_channels)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x = self.proj(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        before_pool = x
+        pooled = self.pool(before_pool)
+
+        return (pooled, before_pool) if self.skip_out else (pooled, None)
+
+
+class NAFUpBlock3D(BaseUnetBlock3D):
+    """NAFNet-inspired upsampling block for 3D data."""
+
+    def _build_layers(self):
+        num_blocks = self.kwargs.get("num_blocks", 2)
+        dw_expand = self.kwargs.get("dw_expand", 2)
+        ffn_expand = self.kwargs.get("ffn_expand", 2)
+
+        x_upsampled_channels = self.out_channels
+        skip_channels = self.out_channels
+
+        # Define projection layers based on merge mode
+        if self.merge_mode == "concat":
+            merged_channels_skip_present = x_upsampled_channels + skip_channels
+            merged_channels_skip_absent = x_upsampled_channels
+        else:  # add mode
+            merged_channels_skip_present = self.out_channels
+            merged_channels_skip_absent = self.out_channels
+
+        # Projection layers
+        self.proj_skip_present = (
+            conv111(merged_channels_skip_present, self.out_channels)
+            if merged_channels_skip_present != self.out_channels
+            else nn.Identity()
+        )
+
+        if self.merge_mode == "concat":
+            self.proj_skip_absent = (
+                conv111(merged_channels_skip_absent, self.out_channels)
+                if merged_channels_skip_absent != self.out_channels
+                else nn.Identity()
+            )
+
+        # NAF blocks - note: NAFBlock3D doesn't use the activation parameter
+        self.blocks = nn.ModuleList(
+            [
+                NAFBlock3D(
+                    self.out_channels,
+                    dw_expand=dw_expand,
+                    ffn_expand=ffn_expand,
+                    dropout_p=self.dropout_p,
+                    z_conv=self.z_conv,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
+        x_up = self.up_sample(x)
+
+        if skip is not None:
+            merged = self.merge(x_up, skip)
+            x = self.proj_skip_present(merged)
+        else:
+            if self.merge_mode == "concat":
+                x = self.proj_skip_absent(x_up)
+            else:
+                x = self.proj_skip_present(x_up)
+
+        for block in self.blocks:
+            x = block(x)
+
+        return x
+
+
+# Decoder blocks
+class EfficientUpBlock3D(BaseUnetBlock3D):
+    """Efficient upsampling block with skip connection fusion."""
+
+    def _build_layers(self):
+        x_upsampled_channels = self.out_channels
+        skip_channels = self.out_channels  # Convention for skip connections
+
+        # Define layers for when skip connection IS present
+        if self.merge_mode == "concat":
+            merged_channels_skip_present = x_upsampled_channels + skip_channels
+        else:  # add mode
+            merged_channels_skip_present = self.out_channels
+
+        self.conv1_skip_present = conv333(
+            merged_channels_skip_present, self.out_channels, z_conv=self.z_conv
+        )
+        self.residual_conv_skip_present = conv111(merged_channels_skip_present, self.out_channels)
+
+        # Define specific conv1 for when skip is ABSENT and mode is "concat"
+        if self.merge_mode == "concat":
+            # Input is x_upsampled (self.out_channels)
+            self.conv1_skip_absent_concat = conv333(
+                self.out_channels, self.out_channels, z_conv=self.z_conv
+            )
+        # Note: If merge_mode is "add" and skip is absent, self.conv1_skip_present can be reused
+        # as its input channel count (self.out_channels) matches x_upsampled.
+
+        self.norm1 = LayerNorm3D(self.out_channels)
+        self.conv2 = conv333(self.out_channels, self.out_channels, z_conv=self.z_conv)
+        self.norm2 = LayerNorm3D(self.out_channels)
+
+        # For the residual path when skip is ABSENT (input is x_upsampled with self.out_channels)
+        self.residual_proj_skip_absent = nn.Identity()
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
+        x_upsampled = self.up_sample(x)  # Outputs self.out_channels
+
+        current_residual: torch.Tensor
+        main_path_after_conv1: torch.Tensor  # Renamed for clarity
+
+        if skip is not None:
+            # This merge function must be from your .layers import
+            merged_x = self.merge(x_upsampled, skip)
+            current_residual = self.residual_conv_skip_present(merged_x)
+            main_path_after_conv1 = self.conv1_skip_present(merged_x)
+        else:  # skip is None
+            current_residual = self.residual_proj_skip_absent(x_upsampled)  # Processes x_upsampled
+            if self.merge_mode == "concat":
+                # merged_x would be x_upsampled (self.out_channels).
+                # self.conv1_skip_present expects 2*out_channels for concat mode.
+                # So, use self.conv1_skip_absent_concat which expects self.out_channels.
+                main_path_after_conv1 = self.conv1_skip_absent_concat(x_upsampled)
+            else:  # merge_mode == "add"
+                # merged_x would be x_upsampled (self.out_channels).
+                # self.conv1_skip_present expects self.out_channels for add mode. This is fine.
+                main_path_after_conv1 = self.conv1_skip_present(x_upsampled)
+
+        out = self.norm1(main_path_after_conv1)
+        out = self.activation(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.activation(out)
+
+        out = out + current_residual  # Add residual
+        return self.dropout(out)
+
+
+class ConvNeXtUpBlock3D(BaseUnetBlock3D):
+    """Upsampling block using ConvNeXt design."""
+
+    def _build_layers(self):
+        x_upsampled_channels = self.out_channels
+        skip_channels = self.out_channels  # Convention
+
+        num_blocks = self.kwargs.get("num_blocks", 2)
+        expand_ratio = self.kwargs.get("expand_ratio", 4)
+        kernel_size = self.kwargs.get("kernel_size", 7)
+
+        # Define projection layer for when skip IS present
+        if self.merge_mode == "concat":
+            merged_input_channels_skip_present = x_upsampled_channels + skip_channels
+        else:  # add mode
+            merged_input_channels_skip_present = self.out_channels
+
+        if merged_input_channels_skip_present != self.out_channels:
+            self.proj_skip_present = nn.Conv3d(
+                merged_input_channels_skip_present, self.out_channels, kernel_size=1
+            )
+        else:
+            self.proj_skip_present = nn.Identity()
+
+        # Define projection for when skip is ABSENT and mode is "concat"
+        if self.merge_mode == "concat":
+            # Input is x_upsampled (self.out_channels). Output for ConvNeXt blocks must be self.out_channels.
+            # An Identity layer is sufficient if channels already match and no other transformation is needed.
+            self.proj_skip_absent_concat = nn.Identity()
+        # Note: If merge_mode is "add" and skip is absent, self.proj_skip_present can be reused
+        # as its input (self.out_channels) matches x_upsampled, and it outputs self.out_channels.
+
+        self.blocks = nn.ModuleList(
+            [
+                ConvNeXtBlock3D(
+                    self.out_channels,  # Blocks always operate on self.out_channels
+                    expand_ratio=expand_ratio,
+                    kernel_size=kernel_size,
+                    z_conv=self.z_conv,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
+        x_up = self.up_sample(x)  # Has self.out_channels
+
+        projected_x: torch.Tensor  # This will be the input to self.blocks
+
+        if skip is not None:
+            # This merge function must be from your .layers import
+            merged_tensor = self.merge(x_up, skip)
+            # self.proj_skip_present handles the merged_tensor (potentially 2*out_channels or out_channels)
+            # and projects it to self.out_channels.
+            projected_x = self.proj_skip_present(merged_tensor)
+        else:  # skip is None
+            # Input to ConvNeXt blocks must be self.out_channels. x_up already has self.out_channels.
+            if self.merge_mode == "concat":
+                # self.proj_skip_present was configured for 2*out_channels input in concat mode.
+                # Here, input is x_up (self.out_channels). Use self.proj_skip_absent_concat.
+                projected_x = self.proj_skip_absent_concat(x_up)
+            else:  # merge_mode == "add"
+                # self.proj_skip_present was configured for self.out_channels input in add mode.
+                # Input x_up (self.out_channels) is compatible.
+                projected_x = self.proj_skip_present(x_up)
+
+        # Pass the correctly projected tensor through the ConvNeXt blocks
+        for block_module in self.blocks:  # Renamed to avoid conflict
+            projected_x = block_module(projected_x)
+        return self.dropout(projected_x)
+
+
+# Legacy blocks (kept for backward compatibility only)
+class DownConvTri3D(nn.Module):
+    """Legacy triple convolution downsampling block."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        z_conv: bool = True,
+        skip_out: bool = True,
+        dropout_p: float = 0.0,
+        group_norm: int = 0,
+        down_mode: str = "maxpool",
+        activation: str = "relu",
+        **kwargs,
+    ):
+        super().__init__()
+
+        if group_norm > 0 and out_channels % group_norm != 0:
+            raise ValueError(
+                f"out_channels ({out_channels}) must be divisible by group_norm ({group_norm})"
+            )
+
+        self.skip_out = skip_out
+        self.z_conv = z_conv
+        self.resconv = conv333(in_channels, out_channels, z_conv)
+        self.conv2 = conv333(out_channels, out_channels, z_conv)
+        self.conv3 = conv333(out_channels, out_channels, z_conv)
+        self.pool = pool(out_channels, out_channels, down_mode, z_conv, kwargs.get("last", False))
+        self.dropout = nn.Dropout3d(p=dropout_p) if dropout_p > 0 else nn.Identity()
+        self.group_norm = (
+            nn.GroupNorm(group_norm, out_channels) if group_norm > 0 else nn.Identity()
+        )
+        # Use activation_function factory
+        self.activation = activation_function(activation, **kwargs.get("activation_kwargs", {}))
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        residual = self.group_norm(self.resconv(x))
+        out = self.activation(self.group_norm(self.conv2(residual)))
+        out = self.activation(self.group_norm(self.conv3(out) + residual))
+        before_pool = self.dropout(out)
+        output = self.pool(before_pool)
+        return (output, before_pool) if self.skip_out else (output, None)
+
+
+class UpConvTri3D(nn.Module):
+    """Legacy triple convolution upsampling block."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        z_conv: bool = True,
+        skip_out: bool = True,  # skip_out is not typically used by Up blocks, but kept for consistency
+        dropout_p: float = 0.0,
+        group_norm: int = 0,
+        up_mode: str = "transpose",
+        merge_mode: str = "concat",
+        activation: str = "relu",
+        **kwargs,
+    ):
+        super().__init__()
+
+        if group_norm > 0 and out_channels % group_norm != 0:
+            raise ValueError(
+                f"out_channels ({out_channels}) must be divisible by group_norm ({group_norm})"
+            )
+
+        self.z_conv = z_conv
+        self.up_sample = upconv222(in_channels, out_channels, z_conv, up_mode)
+        self.merge = partial(merge, merge_mode=merge_mode)
+        # merge_conv in UpConvTri3D assumes it gets 'out_channels' from skip and 'out_channels' from up_sample
+        # and its internal conv handles the doubled channels if mode is concat.
+        self.resconv = merge_conv(out_channels, out_channels, z_conv, merge_mode)
+        self.conv2 = conv333(out_channels, out_channels, z_conv)
+        self.conv3 = conv333(out_channels, out_channels, z_conv)
+        self.dropout = nn.Dropout3d(p=dropout_p) if dropout_p > 0 else nn.Identity()
+        self.group_norm = (
+            nn.GroupNorm(group_norm, out_channels) if group_norm > 0 else nn.Identity()
+        )
+        # Use activation_function factory
+        self.activation = activation_function(activation, **kwargs.get("activation_kwargs", {}))
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
+        x_up = self.up_sample(x)
+        # The merge function here should be the one from .layers
+        merged_output = self.merge(x_up, skip)
+
+        # The legacy resconv is only applied if skip is present, effectively processing the merged data.
+        # If skip is None, merged_output is x_up, and resconv is skipped.
+        # This logic is different from the modern blocks and is preserved for legacy.
+        if skip is not None:
+            residual = self.group_norm(self.resconv(merged_output))
+        else:
+            residual = merged_output  # which is x_up if skip is None
+
+        out = self.activation(self.group_norm(self.conv2(residual)))
+        out = self.activation(self.group_norm(self.conv3(out) + residual))
+        return self.dropout(out)
+
+
+# Aliases and block mapping
+DownBlock3D = EfficientDownBlock3D
+UpBlock3D = EfficientUpBlock3D
+
+BLOCK = {
+    "default": (EfficientDownBlock3D, EfficientUpBlock3D),
+    "efficient": (EfficientDownBlock3D, EfficientUpBlock3D),
+    "convnext": (ConvNeXtDownBlock3D, ConvNeXtUpBlock3D),
+    "nafnet": (NAFDownBlock3D, NAFUpBlock3D),  # Added NAFNet blocks
+    "tri": (DownConvTri3D, UpConvTri3D),  # Legacy, kept for compatibility
+    "dual": (DownConvTri3D, UpConvTri3D),  # Map dual to tri for backward compatibility
+}
+</file>
+
+<file path="src/ssunet/modules/layers.py">
+# src/ssunet/modules/layers.py
+
+import torch
+from torch import nn
+from typing import TypeAlias, ClassVar
+
+from ..constants import LOGGER  # Ensure ..constants.LOGGER is correctly set up
+from .normalization import get_norm_layer
+from .special_layers import (
+    GatedReLUMix,
+    # PartialConv3d, # If used
+    PixelShuffle2d,
+    PixelShuffle3d,
+    PixelUnshuffle2d,
+    PixelUnshuffle3d,
+    SinGatedMix,
+)
+
+KernelSize3D: TypeAlias = int | tuple[int, int, int]
+Stride3D: TypeAlias = int | tuple[int, int, int]
+
+
+# --- Refined Convolution Creation ---
+def _calculate_padding(kernel_size: KernelSize3D, z_conv: bool) -> int | tuple[int, int, int]:
+    actual_kernel_tuple: tuple[int, int, int]
+    if isinstance(kernel_size, int):
+        actual_kernel_tuple = (
+            (kernel_size, kernel_size, kernel_size) if z_conv else (1, kernel_size, kernel_size)
+        )
+    else:
+        actual_kernel_tuple = kernel_size
+    if not all(k > 0 for k in actual_kernel_tuple):
+        raise ValueError(f"Kernel dimensions must be positive, got {actual_kernel_tuple}")
+    padding = tuple(k // 2 for k in actual_kernel_tuple)
+    if len(padding) == 3 and actual_kernel_tuple[0] == 1 and not z_conv:
+        return (0, padding[1], padding[2])
+    if all(p == padding[0] for p in padding) and isinstance(kernel_size, int):
+        return padding[0]
+    return padding
+
+
+def create_conv3d(
+    in_channels: int,
+    out_channels: int,
+    kernel_size: KernelSize3D,
+    z_conv: bool = True,
+    stride: Stride3D = 1,
+    is_depthwise: bool = False,
+    bias: bool = True,  # Bias is now determined by caller context (e.g. build_conv_unit3d)
+) -> nn.Conv3d:
+    actual_kernel: KernelSize3D = kernel_size
+    if isinstance(kernel_size, int) and not z_conv and kernel_size > 1:
+        actual_kernel = (1, kernel_size, kernel_size)
+
+    padding = _calculate_padding(actual_kernel, z_conv)
+    groups = in_channels if is_depthwise else 1
+    _out_channels = out_channels
+    if is_depthwise and out_channels != in_channels:
+        LOGGER.debug(  # Changed to debug as it's a corrective action
+            f"Depthwise convolution with in_channels ({in_channels}) "
+            f"!= out_channels ({out_channels}). Forcing out_channels=in_channels."
+        )
+        _out_channels = in_channels
+
+    return nn.Conv3d(
+        in_channels,
+        _out_channels,
+        actual_kernel,
+        stride=stride,
+        padding=padding,
+        groups=groups,
+        bias=bias,
+    )
+
+
+# Basic conv helpers now default bias=True. Caller (like build_conv_unit3d) decides final bias.
+def conv111(in_channels: int, out_channels: int, bias: bool = True) -> nn.Conv3d:
+    return create_conv3d(in_channels, out_channels, 1, z_conv=True, bias=bias)
+
+
+def conv333(
+    in_channels: int, out_channels: int, z_conv: bool = True, bias: bool = True
+) -> nn.Conv3d:
+    return create_conv3d(in_channels, out_channels, 3, z_conv=z_conv, bias=bias)
+
+
+def depthwise_conv333(
+    channels: int, z_conv: bool = True, bias: bool = True
+) -> nn.Conv3d:  # Defaulting bias to True here
+    return create_conv3d(channels, channels, 3, z_conv=z_conv, is_depthwise=True, bias=bias)
+
+
+def conv777(
+    in_channels: int, out_channels: int, z_conv: bool = True, bias: bool = True
+) -> nn.Conv3d:
+    return create_conv3d(in_channels, out_channels, 7, z_conv=z_conv, bias=bias)
+
+
+# --- Versatile Convolution Unit Builder ---
+def build_conv_unit3d(
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    z_conv: bool,
+    activation_fn: nn.Module,
+    norm_type: str = "layer",
+    norm_params: dict | None = None,  # e.g. {"num_groups": ...}
+    use_depthwise_separable: bool = False,
+    stride: Stride3D = 1,
+) -> nn.Sequential:
+    if norm_params is None:
+        norm_params = {}
+
+    layers_unit = []
+
+    # Bias is False if a real norm layer (not Identity) follows, otherwise True
+    conv_bias_if_norm_follows = False
+    conv_bias_if_no_norm = True
+
+    if use_depthwise_separable and kernel_size > 1:
+        # Depthwise part
+        # Bias for DW conv: False if its own norm follows, else True
+        dw_actual_bias = conv_bias_if_norm_follows if norm_type != "none" else conv_bias_if_no_norm
+        layers_unit.append(
+            create_conv3d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                z_conv,
+                stride=stride,
+                is_depthwise=True,
+                bias=dw_actual_bias,
+            )
+        )
+        if norm_type != "none":
+            layers_unit.append(get_norm_layer(norm_type, in_channels, **norm_params))
+        layers_unit.append(activation_fn)
+
+        # Pointwise part (1x1x1 conv)
+        # Bias for PW conv: False if final norm follows, else True
+        pw_actual_bias = conv_bias_if_norm_follows if norm_type != "none" else conv_bias_if_no_norm
+        layers_unit.append(
+            create_conv3d(
+                in_channels,
+                out_channels,
+                1,
+                z_conv=True,
+                stride=1,
+                is_depthwise=False,
+                bias=pw_actual_bias,
+            )
+        )
+        current_c_for_final_norm_act = out_channels
+    else:  # Standard convolution
+        std_actual_bias = conv_bias_if_norm_follows if norm_type != "none" else conv_bias_if_no_norm
+        layers_unit.append(
+            create_conv3d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                z_conv,
+                stride=stride,
+                is_depthwise=False,
+                bias=std_actual_bias,
+            )
+        )
+        current_c_for_final_norm_act = out_channels
+
+    if norm_type != "none":
+        layers_unit.append(get_norm_layer(norm_type, current_c_for_final_norm_act, **norm_params))
+    layers_unit.append(activation_fn)
+
+    return nn.Sequential(*layers_unit)
+
+
+# --- Activation Function Factory ---
+def activation_function(activation_name: str, activation_params: dict | None = None) -> nn.Module:
+    if activation_params is None:
+        activation_params = {}
+    name_lower = activation_name.lower()
+    if name_lower == "relu":
+        return nn.ReLU(inplace=True)
+    if name_lower == "leaky":
+        return nn.LeakyReLU(inplace=True, **activation_params)
+    if name_lower == "silu":
+        return nn.SiLU(inplace=True)
+    if name_lower == "gelu":
+        return nn.GELU(**activation_params)
+    if name_lower == "gated_relu_mix":
+        return GatedReLUMix()
+    if name_lower == "sin_gated_mix":
+        return SinGatedMix()
+    if name_lower == "none":
+        return nn.Identity()
+    LOGGER.warning(f"Unknown activation: {activation_name}. Using ReLU.")
+    return nn.ReLU(inplace=True)
+
+
+# --- Pooling and Upsampling (adapted) ---
+def pool(
+    in_channels: int,
+    out_channels: int,
+    down_mode: str,
+    z_conv: bool,
+    is_last_stage: bool = False,
+) -> nn.Module:  # Removed default_conv_bias, bias decided internally
+    if is_last_stage:
+        return nn.Identity()
+    kernel_size_pool: KernelSize3D = 2 if z_conv else (1, 2, 2)
+    stride_pool: Stride3D = 2 if z_conv else (1, 2, 2)
+
+    if down_mode == "maxpool":
+        return nn.MaxPool3d(kernel_size_pool, stride=stride_pool)
+    if down_mode == "avgpool":
+        return nn.AvgPool3d(kernel_size_pool, stride=stride_pool)
+    if down_mode == "conv":
+        # Strided conv usually doesn't have norm right after it in this context (it *is* the downsampling)
+        return create_conv3d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size_pool,
+            z_conv=z_conv,
+            stride=stride_pool,
+            bias=True,
+        )  # Default True bias
+    if down_mode == "unshuffle":
+        unshuffle_module: nn.Module
+        expected_after_unshuffle: int
+        if z_conv:
+            unshuffle_module = PixelUnshuffle3d(2)
+            expected_after_unshuffle = in_channels * 8
+        else:
+            unshuffle_module = PixelUnshuffle2d(2)
+            expected_after_unshuffle = in_channels * 4
+        if out_channels == expected_after_unshuffle:
+            return unshuffle_module
+        return nn.Sequential(
+            unshuffle_module,
+            conv111(expected_after_unshuffle, out_channels, bias=True),  # 1x1, default True bias
+        )
+    LOGGER.warning(f"Unknown down_mode: {down_mode}. Using maxpool.")
+    return nn.MaxPool3d(kernel_size_pool, stride=stride_pool)
+
+
+def upconv222(
+    in_channels: int,
+    out_channels: int,
+    z_conv: bool,
+    up_mode: str = "transpose",
+) -> nn.Module:  # Removed default_conv_bias
+    kernel_t: KernelSize3D = 2 if z_conv else (1, 2, 2)
+    stride_t: Stride3D = 2 if z_conv else (1, 2, 2)
+    scale_factor_tuple: tuple[int, int, int] | tuple[float, float, float] = (
+        (2.0, 2.0, 2.0) if z_conv else (1.0, 2.0, 2.0)
+    )
+
+    if up_mode == "transpose":
+        return nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_t, stride=stride_t, bias=True
+        )  # Default True
+    if up_mode == "pixelshuffle":
+        shuffle_module: nn.Module
+        div_factor = 8 if z_conv else 4
+        if in_channels % div_factor == 0:
+            shuffled_ch = in_channels // div_factor
+            shuffle_module = PixelShuffle3d(2) if z_conv else PixelShuffle2d(2)
+            if shuffled_ch == out_channels:
+                return shuffle_module
+            return nn.Sequential(
+                shuffle_module, conv111(shuffled_ch, out_channels, bias=True)
+            )  # Default True
+        LOGGER.warning(f"PixelShuffle{'3D' if z_conv else '2D'} fail. Fallback TransposeConv.")
+        return nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_t, stride=stride_t, bias=True
+        )  # Default True
+
+    upsample_mode = up_mode if up_mode in ["trilinear", "nearest", "bilinear"] else "trilinear"
+    align_corners_val = None
+    if (
+        upsample_mode == "trilinear" or upsample_mode == "bilinear" or upsample_mode == "linear"
+    ):  # PyTorch specific for linear modes
+        align_corners_val = False
+    return nn.Sequential(
+        nn.Upsample(
+            scale_factor=scale_factor_tuple, mode=upsample_mode, align_corners=align_corners_val
+        ),
+        conv333(
+            in_channels, out_channels, z_conv, bias=True
+        ),  # Conv after upsample, default True bias
+    )
+
+
+# --- Merge operations ---
+def merge(
+    input_a: torch.Tensor, input_b: torch.Tensor | None, merge_mode: str = "concat"
+) -> torch.Tensor:
+    if input_b is None:
+        return input_a
+    if merge_mode == "concat":
+        return torch.cat((input_a, input_b), dim=1)
+    if merge_mode == "add":
+        if input_a.shape != input_b.shape:
+            LOGGER.warning(
+                f"Add merge: shapes mismatch {input_a.shape} vs {input_b.shape}. Attempting 1x1 on skip."
+            )
+            if input_a.shape[1] != input_b.shape[1]:
+                proj = conv111(input_b.shape[1], input_a.shape[1], bias=True).to(
+                    input_b.device, input_b.dtype
+                )
+                input_b = proj(input_b)
+            # Add more checks for spatial dimensions if necessary, potentially padding/cropping
+        return input_a + input_b
+    LOGGER.warning(f"Unknown merge_mode: {merge_mode}. Using concat.")
+    return torch.cat((input_a, input_b), dim=1)
+
+
+# --- Specialized Blocks ---
+class ConvNeXtBlock3D(nn.Module):
+    DEFAULT_BLOCK_CONFIG: dict = {
+        "expand_ratio": 4,
+        "kernel_size": 7,
+        "layer_scale_init": 1e-6,
+        "norm_type": "layer",
+        "activation_name": "gelu",
+    }
+
+    def __init__(self, channels: int, z_conv: bool = True, block_config: dict | None = None):
+        super().__init__()
+        cfg = {**self.DEFAULT_BLOCK_CONFIG, **(block_config or {})}
+        norm_params_internal = {}  # If norm_params were needed for get_norm_layer
+
+        # DW Conv is followed by Norm, so bias=False
+        self.dwconv = create_conv3d(
+            channels, channels, cfg["kernel_size"], z_conv, is_depthwise=True, bias=False
+        )
+        self.norm = get_norm_layer(cfg["norm_type"], channels, **norm_params_internal)
+
+        hidden_dim = channels * cfg["expand_ratio"]
+        # Linear layers are not typically followed by spatial norm, so bias=True
+        self.pwconv1 = nn.Linear(channels, hidden_dim, bias=True)
+        self.act = activation_function(cfg["activation_name"], None)
+        self.pwconv2 = nn.Linear(hidden_dim, channels, bias=True)
+
+        if cfg["layer_scale_init"] > 0:
+            self.layer_scale = nn.Parameter(
+                cfg["layer_scale_init"] * torch.ones((channels, 1, 1, 1)), requires_grad=True
+            )
+        else:
+            self.layer_scale = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_tensor = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        return (
+            input_tensor + self.layer_scale(x)
+            if isinstance(self.layer_scale, nn.Parameter)
+            else input_tensor + x
+        )
+
+
+class SimpleGate3D(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class NAFBlock3D(nn.Module):
+    DEFAULT_BLOCK_CONFIG: dict | Cl = {
+        "dw_expand": 2,
+        "ffn_expand": 2,
+        "dropout_p": 0.0,
+        "norm_type": "layer",  # NAFNet uses LayerNorm
+    }
+
+    def __init__(self, channels: int, z_conv: bool = True, block_config: dict | None = None):
+        super().__init__()
+        cfg = {**self.DEFAULT_BLOCK_CONFIG, **(block_config or {})}
+        norm_params_internal = {}
+
+        dw_channels = channels * cfg["dw_expand"]
+        ffn_channels = channels * cfg["ffn_expand"]
+
+        # Convs in NAFNet are complex; some are followed by norm, some not directly part of a unit.
+        # NAFNet's original paper implies biases are generally true for their convs.
+        # For simplicity here, let's assume True unless explicitly a conv-norm unit.
+        # This block doesn't use build_conv_unit3d, so manual bias decisions.
+        self.conv1 = conv111(
+            channels, dw_channels, bias=True
+        )  # Followed by norm in forward, but after xform
+        kernel_dw: KernelSize3D = 3 if z_conv else (1, 3, 3)
+        padding_dw = _calculate_padding(kernel_dw, z_conv)
+        self.conv2 = nn.Conv3d(
+            dw_channels, dw_channels, kernel_dw, 1, padding_dw, groups=dw_channels, bias=True
+        )  # DW
+
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), conv111(dw_channels // 2, dw_channels // 2, bias=True)
+        )
+        self.conv3 = conv111(dw_channels // 2, channels, bias=True)
+        self.conv4 = conv111(channels, ffn_channels, bias=True)
+        self.conv5 = conv111(ffn_channels // 2, channels, bias=True)
+
+        self.sg1 = SimpleGate3D()
+        self.sg2 = SimpleGate3D()
+        self.norm1 = get_norm_layer(cfg["norm_type"], channels, **norm_params_internal)
+        self.norm2 = get_norm_layer(cfg["norm_type"], channels, **norm_params_internal)
+        self.dropout1 = nn.Dropout3d(cfg["dropout_p"]) if cfg["dropout_p"] > 0 else nn.Identity()
+        self.dropout2 = nn.Dropout3d(cfg["dropout_p"]) if cfg["dropout_p"] > 0 else nn.Identity()
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.norm1(x)
+        out = self.conv1(out)
+        out = self.conv2(out)
+        out = self.sg1(out)
+        out = out * self.sca(out)
+        out = self.conv3(out)
+        out = self.dropout1(out)
+        x = identity + out * self.beta
+        identity = x
+        out = self.norm2(x)
+        out = self.conv4(out)
+        out = self.sg2(out)
+        out = self.conv5(out)
+        out = self.dropout2(out)
+        return identity + out * self.gamma
+</file>
+
+<file path="src/ssunet/modules/normalization.py">
+# src/ssunet/modules/normalization.py
+"""Normalization layers for 3D convolution outputs."""
+
+import torch
+from torch import nn
+
+
+class LayerNorm3D(nn.Module):
+    """LayerNorm for 3D convolution outputs."""
+
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super().__init__()
+        # LayerNorm default elementwise_affine=True, meaning it has learnable gamma and beta
+        self.norm = nn.LayerNorm(num_features, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x is (B, C, D, H, W)
+        x = x.permute(0, 2, 3, 4, 1)  # (B, D, H, W, C)
+        x = self.norm(x)
+        return x.permute(0, 4, 1, 2, 3)  # (B, C, D, H, W)
+
+
+def get_norm_layer(norm_type: str, num_features: int, **kwargs: dict) -> nn.Module:
+    """Factory function to get normalization layer."""
+    norm_type_lower = norm_type.lower()
+    if num_features <= 0:  # Cannot normalize 0 features
+        return nn.Identity()
+
+    if norm_type_lower == "layer":
+        return LayerNorm3D(num_features, **kwargs)  # eps can be passed via kwargs
+    if norm_type_lower == "batch":
+        # BatchNorm3d default affine=True (learnable gamma/beta)
+        return nn.BatchNorm3d(num_features, **kwargs)  # eps, momentum etc.
+    if norm_type_lower == "group":
+        num_groups = kwargs.get("num_groups", 32)
+        if num_features % num_groups != 0:
+            # Try to find a valid number of groups
+            found_valid_group = False
+            for ng in range(min(num_groups, num_features), 0, -1):
+                if num_features % ng == 0:
+                    num_groups = ng
+                    found_valid_group = True
+                    break
+            if not found_valid_group:  # Should not happen if num_features > 0
+                num_groups = 1  # Fallback to LayerNorm-like behavior
+        # GroupNorm default affine=True
+        return nn.GroupNorm(num_groups, num_features, **kwargs)  # eps
+    if norm_type_lower == "instance":
+        # InstanceNorm3d default affine=False,
+        # but often set to True in practice if learnable params are desired.
+        # Let's assume affine=True to be consistent with others having learnable params.
+        return nn.InstanceNorm3d(num_features, affine=kwargs.get("affine", True), **kwargs)
+    if norm_type_lower == "none" or norm_type_lower == "":
+        return nn.Identity()
+
+    raise ValueError(f"Unknown normalization type: {norm_type}")
+</file>
+
+<file path="src/ssunet/modules/special_layers.py">
+# src/ssunet/modules/special_layers.py
+"""Special convolution layers and custom components for SSUnet."""
+
+import torch
+import torch.nn.functional as F  # noqa: N812
+from torch import nn
+
+
+# Custom Activation Functions
+class GatedReLUMix(nn.Module):
+    """Mixes two parallel processing paths using ReLU and gating mechanism."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        channels = x.shape[1]
+        if channels % 2 != 0:
+            raise ValueError(f"Input channels must be even for GatedReLUMix, but got {channels}")
+        x1, x2 = torch.chunk(x, 2, dim=1)
+        out1 = F.relu(x1)
+        out2 = x1 * x2
+        return torch.cat((out1, out2), dim=1)
+
+
+class SinGatedMix(nn.Module):
+    """Mixes a direct sinusoidal activation with sinusoidally gated second half."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        channels = x.shape[1]
+        if channels % 2 != 0:
+            raise ValueError(f"Input channels must be even for SinGatedMix, but got {channels}")
+        x1, x2 = torch.chunk(x, 2, dim=1)
+        sin_gate_x1 = torch.sin(x1)
+        out1 = sin_gate_x1
+        out2 = sin_gate_x1 * x2
+        return torch.cat((out1, out2), dim=1)
+
+
+# Partial Convolution Layers (Example, assuming full definition exists if used)
+class PartialConv3d(nn.Conv3d):
+    def __init__(self, *args, multi_channel: bool = True, return_mask: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ... (full implementation) ...
+        pass  # Placeholder
+
+
+# Pixel Shuffle/Unshuffle Layers
+class PixelShuffle3d(nn.Module):
+    """3D version of pixel shuffle for efficient upsampling."""
+
+    def __init__(self, scale: int = 2):
+        super().__init__()
+        if scale <= 0:
+            raise ValueError("Scale must be positive.")
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        s = self.scale
+        if C % (s**3) != 0:
+            raise ValueError(f"Input channels ({C}) must be divisible by scale^3 ({s**3}).")
+        C_out = C // (s**3)
+        D_out, H_out, W_out = D * s, H * s, W * s
+
+        x = x.contiguous().view(B, C_out, s, s, s, D, H, W)
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()  # B, C_out, D,s,H,s,W,s
+        return x.view(B, C_out, D_out, H_out, W_out)
+
+
+class PixelUnshuffle3d(nn.Module):
+    """3D version of pixel unshuffle for efficient downsampling."""
+
+    def __init__(self, scale: int = 2):
+        super().__init__()
+        if scale <= 0:
+            raise ValueError("Scale must be positive.")
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        s = self.scale
+        if not all(dim % s == 0 for dim in (D, H, W)):
+            raise ValueError(f"Spatial dimensions ({D},{H},{W}) must be divisible by scale ({s}).")
+        C_out = C * (s**3)
+        D_out, H_out, W_out = D // s, H // s, W // s
+
+        x = x.contiguous().view(B, C, D_out, s, H_out, s, W_out, s)
+        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()  # B, C, s,s,s, D_out,H_out,W_out
+        return x.view(B, C_out, D_out, H_out, W_out)
+
+
+class PixelShuffle2d(nn.Module):
+    """2D pixel shuffle on BCZXY data (XY only)."""
+
+    def __init__(self, scale: int = 2):
+        super().__init__()
+        if scale <= 0:
+            raise ValueError("Scale must be positive.")
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, C, Z, H, W)
+        B, C, Z, H, W = x.shape
+        s = self.scale
+        if C % (s**2) != 0:
+            raise ValueError(f"Input channels ({C}) must be divisible by scale^2 ({s**2}).")
+        C_out = C // (s**2)
+        H_out, W_out = H * s, W * s
+
+        x = x.contiguous().view(B, C_out, s, s, Z, H, W)
+        x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()  # B, C_out, Z, H,s, W,s
+        return x.view(B, C_out, Z, H_out, W_out)
+
+
+class PixelUnshuffle2d(nn.Module):
+    """2D pixel unshuffle on BCZXY data (XY only)."""
+
+    def __init__(self, scale: int = 2):
+        super().__init__()
+        if scale <= 0:
+            raise ValueError("Scale must be positive.")
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, C, Z, H, W)
+        B, C, Z, H, W = x.shape
+        s = self.scale
+        if not all(dim % s == 0 for dim in (H, W)):
+            raise ValueError(f"H,W dimensions ({H},{W}) must be divisible by scale ({s}).")
+        C_out = C * (s**2)
+        H_out, W_out = H // s, W // s
+
+        x = x.contiguous().view(B, C, Z, H_out, s, W_out, s)
+        x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()  # B, C, s,s, Z, H_out,W_out
+        return x.view(B, C_out, Z, H_out, W_out)
+</file>
+
+<file path="src/ssunet/modules/__init__.py">
+"""SSUnet modules for 3D medical image processing."""
+
+from .blocks import (
+    BLOCK,
+    ConvNeXtDownBlock3D,
+    ConvNeXtUpBlock3D,
+    DownBlock3D,
+    DownConvTri3D,
+    EfficientDownBlock3D,
+    EfficientUpBlock3D,
+    NAFBlock3D,
+    NAFDownBlock3D,
+    NAFUpBlock3D,
+    SimpleGate3D,
+    UpBlock3D,
+    UpConvTri3D,
+)
+from .layers import (
+    ChannelAttention,
+    Conv3DBlock,
+    ConvNeXtBlock3D,
+    MBConvBlock3D,
+    activation_function,
+    conv111,
+    conv333,
+    conv777,
+    merge,
+    merge_conv,
+    partial333,
+    pool,
+    upconv222,
+)
+from .normalization import LayerNorm3D, get_norm_layer
+from .special_layers import (
+    GatedReLUMix,
+    PartialConv2d,
+    PartialConv3d,
+    PixelShuffle2d,
+    PixelShuffle3d,
+    PixelUnshuffle2d,
+    PixelUnshuffle3d,
+    SinGatedMix,
+)
+
+__all__ = [  # noqa: RUF022
+    # Blocks
+    "BLOCK",
+    "DownBlock3D",
+    "UpBlock3D",
+    "EfficientDownBlock3D",
+    "EfficientUpBlock3D",
+    "ConvNeXtDownBlock3D",
+    "ConvNeXtUpBlock3D",
+    "NAFBlock3D",
+    "NAFDownBlock3D",
+    "NAFUpBlock3D",
+    "SimpleGate3D",
+    "DownConvTri3D",
+    "UpConvTri3D",
+    # Layers
+    "conv111",
+    "conv333",
+    "conv777",
+    "partial333",
+    "pool",
+    "upconv222",
+    "merge",
+    "merge_conv",
+    "activation_function",
+    "Conv3DBlock",
+    "MBConvBlock3D",
+    "ConvNeXtBlock3D",
+    "ChannelAttention",
+    # Normalization
+    "LayerNorm3D",
+    "get_norm_layer",
+    # Special layers
+    "PartialConv2d",
+    "PartialConv3d",
+    "PixelShuffle3d",
+    "PixelShuffle2d",
+    "PixelUnshuffle3d",
+    "PixelUnshuffle2d",
+    # Custom activations
+    "GatedReLUMix",
+    "SinGatedMix",
+]
+</file>
+
+</files>

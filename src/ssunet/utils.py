@@ -12,8 +12,10 @@ from .constants import EPSILON, LOGGER
 from .exceptions import ConfigFileNotFoundError, UnsupportedDataTypeError
 
 
-def _to_tensor(input: np.ndarray) -> torch.Tensor:
+def to_tensor(input: np.ndarray | torch.Tensor) -> torch.Tensor:
     """Convert the input data to a tensor."""
+    if isinstance(input, torch.Tensor):
+        return input
     try:
         return torch.from_numpy(input)
     except TypeError:
@@ -40,8 +42,13 @@ def _load_yaml(config_path: Path | str) -> dict:
 
 
 def _normalize_by_mean(input: torch.Tensor) -> torch.Tensor:
-    """Normalize the input data by the mean."""
-    return input / (input.mean() + EPSILON)
+    """Normalize the input data by the mean while preserving the original scale.
+
+    :param input: Input tensor to normalize
+    :returns: Normalized tensor with preserved scale
+    """
+    original_mean = input.mean()
+    return input / (original_mean + EPSILON) * original_mean
 
 
 def setup_logger(

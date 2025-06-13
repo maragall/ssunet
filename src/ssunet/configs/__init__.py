@@ -1,18 +1,21 @@
 """Configurations for the project."""
 
 from .configs import MasterConfig
-from .data_config import DataConfig, SSUnetData
-from .file_config import PathConfig, SplitParams
+from .data_config import DataConfig, SplitConfig
+from .file_config import FileSource, PathConfig
+from .loader_config import LoaderConfig
 from .model_config import ModelConfig
-from .train_config import LoaderConfig, TrainConfig
+from .split_config import SplitParams
+from .train_config import TrainConfig
 
 __all__ = [
     "DataConfig",
+    "FileSource",
     "LoaderConfig",
     "MasterConfig",
     "ModelConfig",
     "PathConfig",
-    "SSUnetData",
+    "SplitConfig",
     "SplitParams",
     "TrainConfig",
 ]

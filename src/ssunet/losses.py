@@ -30,7 +30,9 @@ def mse_loss(
     exp_energy = torch.exp(result)
     exp_energy = exp_energy / (torch.mean(exp_energy, dim=(-1, -2, -3, -4), keepdim=True) + EPSILON)
     target = target / (torch.mean(target, dim=(-1, -2, -3, -4), keepdim=True) + EPSILON)
-    return torch.mean((exp_energy - target) ** 2)
+    diff = exp_energy - target
+    squared = diff * diff
+    return torch.mean(squared)
 
 
 def l1_loss(

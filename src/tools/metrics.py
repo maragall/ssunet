@@ -50,8 +50,8 @@ class ImageMetrics:
         self.device = device or torch.device("cpu")
         if self.device != self._psnr_metric.device:
             self.set_device(self.device)
-        self._image = self._to_tensor(image)
-        self._target = self._to_tensor(target)
+        self._image = self.to_tensor(image)
+        self._target = self.to_tensor(target)
         if self._image.shape != self._target.shape:
             raise ValueError("MismatchError")
 
@@ -69,7 +69,7 @@ class ImageMetrics:
             self._image = self._image[None, ...]
             self._target = self._target[None, ...]
 
-    def _to_tensor(self, data: np.ndarray | torch.Tensor) -> torch.Tensor:
+    def to_tensor(self, data: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Convert numpy array to tensor."""
         if isinstance(data, torch.Tensor):
             return data
@@ -174,11 +174,11 @@ class ImageMetrics:
 
     def set_image(self, image: torch.Tensor | np.ndarray) -> None:
         """Set a new image for comparison."""
-        self._image = self._to_tensor(image)
+        self._image = self.to_tensor(image)
 
     def set_target(self, target: torch.Tensor | np.ndarray) -> None:
         """Set a new target for comparison."""
-        self._target = self._to_tensor(target)
+        self._target = self.to_tensor(target)
 
 
 @dataclass
@@ -346,7 +346,7 @@ class StackMetricsGroups:
         **kwargs,
     ):
         """Class constructor."""
-        self.group_names = group_names or [f"G{i+1:>02}" for i in range(len(metrics_list))]
+        self.group_names = group_names or [f"G{i + 1:>02}" for i in range(len(metrics_list))]
         self.length = len(self.group_names)
         self.data = {self.group_names[i]: metrics_list[i] for i in range(self.length)}
         self.metric_list = metric_list or metrics_list[0].metric_list

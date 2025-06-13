@@ -55,7 +55,6 @@ MODEL:
   dropout_p: 0.0 # Dropout probability
   scale_factor: 10.0 # Scale factor for the signal levels for sinusoidal encoding
   sin_encoding: False # Whether to use sinusoidal encoding
-  signal_levels: 10 # Number of signal levels in the sinusoidal encoding
   masked: True # Whether to use masked convolutions, true for bit2bit, false for other methods
   down_checkpointing: true # Whether to use checkpointing for the down convolutions, trade-off between memory and speed
   up_checkpointing: False # Whether to use checkpointing for the up convolutions, trade-off between memory and speed

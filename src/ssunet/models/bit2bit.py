@@ -5,7 +5,6 @@ import torch
 import torchmetrics.image as tmi
 from torch import nn
 from torch.nn import init
-from torch.optim import SGD, Adam, AdamW
 from torch.utils.checkpoint import checkpoint
 
 from ..configs.configs import ModelConfig
@@ -14,10 +13,10 @@ from ..exceptions import InvalidUpModeError
 from ..losses import loss_functions
 from ..modules import BLOCK, conv111
 
-OPTIMIZER: dict[str, type[torch.optim.Optimizer]] = {
-    "adam": Adam,
-    "sgd": SGD,
-    "adamw": AdamW,
+OPTIMIZER = {
+    "adam": torch.optim.Adam,
+    "sgd": torch.optim.SGD,
+    "adamw": torch.optim.AdamW,
 }
 
 
@@ -52,23 +51,22 @@ class Bit2Bit(pl.LightningModule):
         self.up_convs = self._up_conv_list()
         self.conv_final = self._final_conv()
 
-        self.save_hyperparameters()
+        self.save_hyperparameters()  # Ensure this uses the updated ModelConfig
         self._reset_params()
 
     def _down_conv_list(self) -> nn.ModuleList:
         """Generate the list of down convolutional layers."""
         down_convs = []
         down_conv_function = BLOCK[self.config.block_type][0]
-        init = (
-            self.config.channels * self.config.signal_levels
-            if self.config.sin_encoding
-            else self.config.channels
-        )
+        initial_channels = self.config.channels
+
         for i in range(self.config.depth):
             z_conv = i < self.config.z_conv_stage
             skip_out = i >= self.config.skip_depth
             in_channels = (
-                init if i == 0 else self.config.start_filts * (self.config.depth_scale ** (i - 1))
+                initial_channels
+                if i == 0
+                else self.config.start_filts * (self.config.depth_scale ** (i - 1))
             )
             out_channels = self.config.start_filts * (self.config.depth_scale**i)
             last = True if i == self.config.depth - 1 else False
@@ -128,12 +126,6 @@ class Bit2Bit(pl.LightningModule):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward pass of the model."""
-        if self.config.sin_encoding:
-            scales = [
-                torch.sin(input.clone() * (self.config.scale_factor ** (-i)))
-                for i in range(self.config.signal_levels)
-            ]
-            input = torch.cat(scales, dim=1)
 
         encoder_outs = []
         for i, down_conv in enumerate(self.down_convs):
@@ -154,23 +146,103 @@ class Bit2Bit(pl.LightningModule):
 
     def configure_optimizers(self) -> dict:
         """Configure the optimizer and scheduler."""
-        config = self.config.optimizer_config
+        opt_config = self.config.optimizer_config  # This is a dict from ModelConfig
+
         optimizer = (
-            OPTIMIZER[config["name"]](self.parameters(), lr=config["lr"], fused=False)
-            if config["name"] in ("adam", "adamw")
-            else OPTIMIZER[config["name"]](self.parameters(), lr=config["lr"])
+            OPTIMIZER[opt_config["name"]](self.parameters(), lr=opt_config["lr"], fused=False)
+            if opt_config["name"] in ("adam", "adamw")
+            and "fused" in torch.optim.AdamW.__init__.__kwdefaults__  # Check if fused is supported
+            else OPTIMIZER[opt_config["name"]](self.parameters(), lr=opt_config["lr"])
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode=config["mode"],
-            factor=config["factor"],
-            patience=config["patience"],
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": scheduler,
-            "monitor": "val_loss",
-        }
+
+        scheduler_name = opt_config.get("scheduler_name", "reduce_lr_on_plateau").lower()
+
+        if scheduler_name == "cosine_annealing":
+            # Determine T_max: use configured value or trainer's max_epochs
+            # self.trainer is available in configure_optimizers
+            t_max_epochs = opt_config.get("cosine_t_max_epochs")
+            if t_max_epochs is None:
+                if (
+                    self.trainer
+                    and self.trainer.max_epochs is not None
+                    and self.trainer.max_epochs != -1
+                ):
+                    t_max = self.trainer.max_epochs
+                else:
+                    # Fallback if trainer.max_epochs isn't available or set,
+                    # though this should ideally come from config or be ensured by trainer setup.
+                    # You might need to pass max_epochs from TrainConfig to ModelConfig
+                    # if self.trainer isn't fully set up.
+                    # For now, let's assume a default or raise an error.
+                    raise ValueError(
+                        "CosineAnnealingLR T_max could not be determined. "
+                        "Ensure TRAIN.max_epochs is set or provide "
+                        "'cosine_t_max_epochs' in optimizer_config."
+                    )
+            else:
+                t_max = int(t_max_epochs)
+
+            eta_min = float(opt_config.get("cosine_eta_min", 0.0))
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=t_max,  # Number of epochs or steps
+                eta_min=eta_min,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",  # Cosine annealing is typically updated per epoch
+                    "frequency": 1,
+                },
+            }
+        elif scheduler_name == "cosine_annealing_warm_restarts":
+            t_0 = opt_config.get("cosine_restarts_t_0")
+            if t_0 is None:
+                raise ValueError(
+                    "CosineAnnealingWarmRestarts 'cosine_restarts_t_0' "
+                    "(epochs for the first restart) must be provided in optimizer_config."
+                )
+            t_0 = int(t_0)
+            t_mult = int(opt_config.get("cosine_restarts_t_mult", 1))
+            eta_min = float(opt_config.get("cosine_restarts_eta_min", 0.0))
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=t_0,
+                T_mult=t_mult,
+                eta_min=eta_min,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",  # Typically updated per epoch
+                    "frequency": 1,
+                },
+            }
+        elif scheduler_name == "reduce_lr_on_plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode=opt_config.get("plateau_mode", "min"),
+                factor=float(opt_config.get("plateau_factor", 0.5)),
+                patience=int(opt_config.get("plateau_patience", 10)),
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": self.config.optimizer_config.get(
+                        "plateau_monitor", "val_loss"
+                    ),  # Ensure monitor is configurable
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+        else:
+            # No scheduler or unknown scheduler
+            return {"optimizer": optimizer}
 
     def training_step(
         self,
@@ -178,27 +250,27 @@ class Bit2Bit(pl.LightningModule):
         batch_idx,
     ) -> torch.Tensor:
         """Training step of the model."""
-        target = batch[0]
-        input = batch[1]
-        output = self(input)
+        y_loss_target = batch[0]
+        x = batch[1]
+        y_pred = self(x)
         loss = (
-            self.loss_function(output, target, (input < 1).float())
+            self.loss_function(y_pred, y_loss_target, (x < 1).float())
             if self.config.masked
-            else self.loss_function(output, target)
+            else self.loss_function(y_pred, y_loss_target)
         )
-        self._tb_train_log(loss, output, target, batch_idx)
+        self._tb_train_log(loss, y_pred, y_loss_target, batch_idx)
         return loss
 
     def _tb_train_log(
         self,
         loss: torch.Tensor,
-        output: torch.Tensor,
-        target: torch.Tensor,
+        prediction: torch.Tensor,
+        loss_target: torch.Tensor,
         batch_idx: int,
     ) -> None:
         """Log the training step."""
         self.log("train_loss", loss)
-        self._log_image(output[0], "train_image", batch_idx, frequency=100)
+        self._log_image(prediction[0], "train_image", batch_idx, frequency=100)
 
     def validation_step(
         self,
@@ -206,53 +278,53 @@ class Bit2Bit(pl.LightningModule):
         batch_idx: int,
     ) -> None:
         """Validation step of the model."""
-        target = batch[0]
-        input = batch[1]
-        ground_truth = batch[2] if len(batch) == 3 else None
-        output = self(input)
-        loss = self.loss_function(output, target)
-        self._tb_val_log(loss, output, target, ground_truth, batch_idx)
+        y_loss_target = batch[0]
+        x = batch[1]
+        y_metrics_target = batch[2] if len(batch) == 3 else None
+        y_pred = self(x)
+        loss = self.loss_function(y_pred, y_loss_target)
+        self._tb_val_log(loss, y_pred, y_loss_target, y_metrics_target, batch_idx)
 
     def _tb_val_log(
         self,
         loss: torch.Tensor,
-        output: torch.Tensor,
-        target: torch.Tensor,
-        ground_truth: torch.Tensor | None,
+        prediction: torch.Tensor,
+        loss_target: torch.Tensor,
+        metrics_target: torch.Tensor | None,
         batch_idx: int,
     ) -> None:
         """Log the validation step. Can be extended for logging metrics."""
-        if ground_truth is not None:
-            self._log_metrics(output, ground_truth, batch_idx)
+        if metrics_target is not None:
+            self._log_metrics(prediction, metrics_target, batch_idx)
         self.log("val_loss", loss)
-        self._log_image(output[0], "val_image", batch_idx, frequency=10)
+        self._log_image(prediction[0], "val_image", batch_idx, frequency=10)
 
     def _log_metrics(
         self,
-        output: torch.Tensor,
-        ground_truth: torch.Tensor,
+        prediction: torch.Tensor,
+        metrics_target: torch.Tensor,
         batch_idx: int,
     ) -> None:
         """Log the metrics.
 
-        :param output: Model output tensor
-        :param ground_truth: Ground truth tensor
+        :param prediction: Model output tensor
+        :param metrics_target: Ground truth tensor for metrics
         :param batch_idx: Current batch index
         """
-        size_z = ground_truth.shape[2]
+        size_z = metrics_target.shape[2]
         index_z = size_z // 2
 
         # Extract middle slice
-        output_slice = output[:, :, index_z, ...]
-        ground_truth_slice = ground_truth[:, :, index_z, ...]
+        prediction_slice = prediction[:, :, index_z, ...]
+        metrics_target_slice = metrics_target[:, :, index_z, ...]
 
         # Scale output to match ground truth mean intensity
-        output_mean = torch.mean(output_slice) + EPSILON
-        ground_truth_mean = torch.mean(ground_truth_slice) + EPSILON
-        output_normalized = output_slice / output_mean * ground_truth_mean
+        prediction_mean = torch.mean(prediction_slice) + EPSILON
+        metrics_target_mean = torch.mean(metrics_target_slice) + EPSILON
+        prediction_normalized = prediction_slice / prediction_mean * metrics_target_mean
 
-        psnr = self.psnr_metric(output_normalized, ground_truth_slice)
-        ssim = self.ssim_metric(output_normalized, ground_truth_slice)
+        psnr = self.psnr_metric(prediction_normalized, metrics_target_slice)
+        ssim = self.ssim_metric(prediction_normalized, metrics_target_slice)
 
         self.log("val_psnr", psnr)
         self.log("val_ssim", ssim)
@@ -346,17 +418,17 @@ class Bit2Bit(pl.LightningModule):
         batch_idx: int,
     ) -> None:
         """Test step of the model."""
-        target = batch[0]
-        input = batch[1]
-        output = self(input)
-        loss = self.loss_function(output, target)
-        self._tb_test_log(loss, output, target, batch_idx)
+        y_loss_target = batch[0]
+        x = batch[1]
+        y_pred = self(x)
+        loss = self.loss_function(y_pred, y_loss_target)
+        self._tb_test_log(loss, y_pred, y_loss_target, batch_idx)
 
     def _tb_test_log(
         self,
         loss: torch.Tensor,
-        output: torch.Tensor,
-        target: torch.Tensor,
+        prediction: torch.Tensor,
+        loss_target: torch.Tensor,
         batch_idx: int,
     ) -> None:
         """Log the test step. Can be extended for logging metrics."""

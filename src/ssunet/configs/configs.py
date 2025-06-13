@@ -12,9 +12,11 @@ import torch
 from ..constants import DEFAULT_CONFIG_PATH
 from ..utils import _load_yaml
 from .data_config import DataConfig
-from .file_config import FileSourceConfig, PathConfig, SplitParams
+from .file_config import FileSource, PathConfig
+from .loader_config import LoaderConfig
 from .model_config import ModelConfig
-from .train_config import LoaderConfig, TrainConfig
+from .split_config import SplitParams
+from .train_config import TrainConfig
 
 
 @dataclass
@@ -148,14 +150,14 @@ class MasterConfig:
         path_section = config_dict.get("PATH", {})
 
         data_source_dict = path_section.get("data", {})
-        data_fsc = FileSourceConfig(**data_source_dict) if data_source_dict else FileSourceConfig()
+        data_fsc = FileSource(**data_source_dict) if data_source_dict else FileSource()
 
         reference_source_dict = path_section.get("reference")
-        reference_fsc = FileSourceConfig(**reference_source_dict) if reference_source_dict else None
+        reference_fsc = FileSource(**reference_source_dict) if reference_source_dict else None
 
         ground_truth_source_dict = path_section.get("ground_truth")
         ground_truth_fsc = (
-            FileSourceConfig(**ground_truth_source_dict) if ground_truth_source_dict else None
+            FileSource(**ground_truth_source_dict) if ground_truth_source_dict else None
         )
 
         path_cfg = PathConfig(

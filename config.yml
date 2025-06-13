@@ -28,13 +28,10 @@ PATH:
 # Data configurations
 DATA:
   xy_size: 256 # Size of the sampled image in the xy plane
-  z_size: 32 # Size of the sampled image in the z direction (depth of the patch)
-  virtual_size: 1200 # Number of samples per epoch. Use 0 for a length derived from data depth (less common for random patch sampling).
   augments: False # Whether to apply data augmentation (flips, transpose)
   rotation: 0 # Max degrees for random rotation (0 for no rotation)
   random_crop: True # True for random patch selection, False for center patch
-  skip_frames: 1 # Number of frames to skip between each sampled data stack, 1 is no skipping
-  normalize_target: True # For BinomDataset target or ValidationDataset target_for_loss
+  normalize_target: True # For BinomDataset target or ValidationDataset target_for_loss. This will now be the primary control.
   note: "test_run_v2" # Note for this data configuration
   seed: Null # Optional: Seed for random_crop and augmentations in BasePatchDataset
 
@@ -44,12 +41,11 @@ SPLIT:
   min_p: 0.000001 # Minimum p level (for "signal" or "fixed" if p_list absent)
   max_p: 0.999999 # Maximum p level (for "signal")
   p_list: Null # List of p levels if method is "list" (e.g., [0.1, 0.5, 0.9])
-  normalize_target: True # Whether to normalize the target component after splitting
   seed: Null # Seed for p-value sampling randomness in BinomDataset
 
 # Model configurations
 MODEL:
-  channels: 1 # Number of channels in the input data
+  channels: 1 # Correct, as TZYX implies C=1, expanded to T(1)ZYX
   depth: 5 # The depth of the unet (number of down/up blocks)
   start_filts: 32 # The number of filters at the first layer
   depth_scale: 2 # The factor by which to scale the number of filters at each depth
@@ -59,8 +55,6 @@ MODEL:
   skip_depth: 0 # The start depth of the skip connections
   dropout_p: 0.0 # Dropout probability
   scale_factor: 10.0 # Scale factor for the signal levels for sinusoidal encoding
-  sin_encoding: False # Whether to use sinusoidal encoding
-  signal_levels: 10 # Number of signal levels in the sinusoidal encoding
   masked: True # Whether to use masked convolutions, true for bit2bit, false for other methods
   down_checkpointing: true # Whether to use checkpointing for the down convolutions, trade-off between memory and speed
   up_checkpointing: False # Whether to use checkpointing for the up convolutions, trade-off between memory and speed
@@ -74,14 +68,27 @@ MODEL:
   optimizer_config: # Optimizer configuration
     name: "adamw" # "adam" | "sgd" | "adamw"
     lr: 0.00032
-    mode: "min" # "min" | "max"
-    factor: 0.5
-    patience: 10
+    scheduler_name: "cosine_annealing_warm_restarts"  # Options: "cosine_annealing" | "cosine_annealing_warm_restarts" | "reduce_lr_on_plateau" | "none"
+
+    # Parameters for CosineAnnealingLR
+    cosine_t_max_epochs: null # If null, uses TRAIN.max_epochs. Total epochs for one cycle.
+    cosine_eta_min: 0.000001          # Minimum learning rate for CosineAnnealingLR
+
+    # Parameters for CosineAnnealingWarmRestarts
+    cosine_restarts_t_0: 10          # Required. Number of epochs for the first restart cycle.
+    cosine_restarts_t_mult: 2        # Optional. Factor to increase T_i after a restart. Default: 1
+    cosine_restarts_eta_min: 0.0000001 # Optional. Minimum learning rate. Default: 0.0
+
+    # Parameters for ReduceLROnPlateau
+    plateau_monitor: "val_loss"     # Metric to monitor
+    plateau_mode: "min"             # "min" | "max"
+    plateau_factor: 0.5             # Factor by which the learning rate will be reduced
+    plateau_patience: 10            # Number of epochs with no improvement after which learning rate will be reduced
 
 # Loader configurations
 LOADER:
-  batch_size: 3 # Number of samples in each batch
-  shuffle: False # Whether to shuffle the data
+  batch_size: 2 # Adjust based on memory
+  shuffle: True # Usually True for training
   pin_memory: False # True can lead to errors
   drop_last: True # Drop the last batch if it is not full
   num_workers: 6 # Number of workers for the dataloader, set to 0 for no parallel processing to prevent errors
@@ -93,7 +100,7 @@ TRAIN:
   accelerator: "cuda" # Options: "cpu" | "cuda", good luck on cpu
   gradient_clip_val: 1 # Gradient clipping value
   precision: "32" # Options: "64" | "32" | "16" | "bf16" | "mixed"
-  max_epochs: 120 # Maximum number of epochs
+  max_epochs: 120 # Maximum number of epochs. Used by CosineAnnealingLR if cosine_t_max_epochs is null.
   devices: [0] # Device numbers, 0 is the first GPU
 
   callbacks_model_checkpoint: True

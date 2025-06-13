@@ -48,8 +48,8 @@ class ConfigFileNotFoundError(ConfigError):
 class ShapeMismatchError(DataError):
     """Error raised when data and reference shapes do not match."""
 
-    def __init__(self):
-        super().__init__("Data and reference shapes do not match")
+    def __init__(self, message: str = "Data and reference shapes do not match"):
+        super().__init__(message)
 
 
 class ImageShapeMismatchError(DataError):
@@ -69,8 +69,8 @@ class UnsupportedDataTypeError(DataError):
 class UnsupportedInputModeError(DataError):
     """Error raised when input mode is not supported."""
 
-    def __init__(self):
-        super().__init__("Input mode not supported")
+    def __init__(self, mode: str):
+        super().__init__(f"Input mode {mode} not supported")
 
 
 class InvalidDataDimensionError(DataError):
