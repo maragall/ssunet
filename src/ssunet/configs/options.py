@@ -1,8 +1,9 @@
 from typing import Literal
 
-DownModeOptions = Literal["maxpool", "avgpool", "conv", "unshuffle"]
-UpModeOptions = Literal["transpose", "upsample", "pixelshuffle"]
-MergeModeOptions = Literal["concat", "add"]
+ConvBlockOptions = Literal["up", "down", "bottleneck", "flexible"]
+DownModeOptions = Literal["maxpool", "avgpool", "conv", "pixelunshuffle", "pixelunshuffle_conv"]
+UpModeOptions = Literal["transpose", "upsample", "pixelshuffle", "pixelshuffle_conv"]
+MergeModeOptions = Literal["concat", "concat_conv", "add", "add_conv"]
 ActivationNameOptions = Literal[
     "relu",
     "leakyrelu",
@@ -14,6 +15,9 @@ ActivationNameOptions = Literal[
     "softmax",
     "logsoftmax",
 ]
+
+InitMethodOptions = Literal["kaiming", "xavier"]
+
 NormTypeOptions = Literal["layer", "batch", "group", "instance"]
 LossFunctionOptions = Literal["mse", "l1", "photon", "photon_2d"]
 BlockTypeOptions = Literal["efficient", "convnext", "nafnet", "tri"]

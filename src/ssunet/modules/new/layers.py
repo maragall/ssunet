@@ -10,15 +10,13 @@ from ...configs.options import (
     NormTypeOptions,
     UpModeOptions,
 )
-from .normalization import get_norm_layer
-from .special_layers import (  # Ensure all used special layers are imported
-    GatedReLUMix,
+from .activations import GatedReLUMix, SimpleGate3D, SinGatedMix
+from .normalizations import get_norm_layer
+from .special_layers import (
     PixelShuffle2d,
     PixelShuffle3d,
     PixelUnshuffle2d,
     PixelUnshuffle3d,
-    SimpleGate3D,  # SimpleGate3D moved from blocks.py
-    SinGatedMix,
 )
 
 LOGGER = getLogger(__name__)
@@ -40,11 +38,9 @@ def _calculate_padding(kernel_size: KernelSize3D, z_conv: bool) -> int | tuple[i
     padding = tuple(k // 2 for k in actual_kernel_tuple)
     if len(padding) == 3 and actual_kernel_tuple[0] == 1 and not z_conv:
         return (0, padding[1], padding[2])
-    if (
-        all(p == padding[0] for p in padding) and isinstance(kernel_size, int) and len(padding) == 3
-    ):  # e.g. kernel_size = 3 -> padding = 1
+    if all(p == padding[0] for p in padding) and isinstance(kernel_size, int) and len(padding) == 3:
         return padding[0]
-    return padding
+    return padding  # type: ignore
 
 
 def create_conv3d(
@@ -289,29 +285,6 @@ def upconv222(
     )
 
 
-# --- Merge Operation ---
-def merge(
-    input_a: torch.Tensor, input_b: torch.Tensor | None, merge_mode: str = "concat"
-) -> torch.Tensor:
-    # (Content from previous response, bias decisions for projection internal to conv111)
-    if input_b is None:
-        return input_a
-    if merge_mode == "concat":
-        return torch.cat((input_a, input_b), dim=1)
-    if merge_mode == "add":
-        if input_a.shape != input_b.shape:
-            LOGGER.warning(f"Add merge: shapes {input_a.shape} vs {input_b.shape}. Proj skip.")
-            if input_a.shape[1] != input_b.shape[1]:  # Project channels of skip
-                proj = conv111(input_b.shape[1], input_a.shape[1], bias=True).to(
-                    input_b.device, input_b.dtype
-                )
-                input_b = proj(input_b)
-            # Add spatial proj/padding if needed
-        return input_a + input_b
-    LOGGER.warning(f"Unknown merge: {merge_mode}. Concat.")
-    return torch.cat((input_a, input_b), dim=1)
-
-
 # --- Specialized Blocks (Internal Units) ---
 class ConvNeXtBlock3D(nn.Module):  # Internal unit for ConvNeXt stages
     DEFAULT_BLOCK_CONFIG: ClassVar[dict] = {
@@ -355,7 +328,7 @@ class ConvNeXtBlock3D(nn.Module):  # Internal unit for ConvNeXt stages
         x = self.act(x)
         x = self.pwconv2(x)
         x = x.permute(0, 4, 1, 2, 3)
-        return inp + self.layer_scale(x) if isinstance(self.layer_scale, nn.Parameter) else inp + x
+        return inp + (self.layer_scale * x if isinstance(self.layer_scale, nn.Parameter) else x)
 
 
 class NAFBlock3D(nn.Module):  # Internal unit for NAFNet stages
