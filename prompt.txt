@@ -1,0 +1,154 @@
+This is a fork of https://github.com/lyehe/ssunet — a self-supervised U-Net for denoising
+3D volumetric microscopy images. We are wrapping it into a minimal GUI application for
+fluorescence microscopy denoising, following the same "brutalist wrapper" pattern as
+https://github.com/maragall/background_subtraction (sibling project in ~/Downloads/background_subtraction).
+
+== WHAT HAS BEEN DONE ==
+
+1. Forked lyehe/ssunet to maragall/ssunet, cloned to this directory.
+2. Fixed packaging: moved src/tools/ into src/ssunet/tools/ so it's importable as
+   ssunet.tools.gpuinference. Fixed relative import in gpuinference.py
+   (from ..ssunet.constants → from ..constants).
+3. Fixed pyproject.toml: packages = ["src/ssunet"] (was ["ssunet"]).
+4. Verified all imports work:
+   - ssunet.models.Bit2Bit (main model)
+   - ssunet.configs.{ModelConfig, DataConfig, TrainConfig, LoaderConfig, SplitParams}
+   - ssunet.configs.data_config.SSUnetData
+   - ssunet.datasets.{BinomDataset, ValidationDataset}
+   - ssunet.tools.gpuinference.gpu_patch_inference
+
+== WHAT NEEDS TO BE DONE ==
+
+Build a wrapper with train + inference pipeline and GUI. The wrapper should:
+
+1. TRAIN on the user's own data (self-supervised — no clean/noisy pairs needed)
+2. DENOISE using the trained model
+3. Provide a minimal PyQt5 GUI (same style as background_subtraction/gui/app.py)
+
+== ARCHITECTURE (follow background_subtraction pattern exactly) ==
+
+The sibling project at ~/Downloads/background_subtraction is the template. Read its structure:
+- src/bgsub/core.py — orchestrator class (BackgroundSubtractor)
+- src/bgsub/io/flat_tiffs.py — reads R0-style flat TIFF acquisitions
+- src/bgsub/io/ome_tiff.py — reads OME-TIFF with acquisition.yaml
+- gui/app.py — PyQt5 GUI with QThread workers, preview, progress bar, drag-drop
+- Same pyproject.toml/hatchling pattern
+
+For this denoising wrapper, add to the existing ssunet repo:
+- src/ssunet/wrapper/core.py — Denoiser orchestrator class
+- src/ssunet/wrapper/io/ — same IO layer as background_subtraction (copy it)
+- gui/app.py — PyQt5 GUI with Train + Denoise workflow
+- scripts/test_denoise.py — validation script
+
+== SSUNET API CHEATSHEET ==
+
+Training:
+```python
+from ssunet.configs import ModelConfig, DataConfig, LoaderConfig, SplitParams
+from ssunet.configs.data_config import SSUnetData
+from ssunet.datasets import BinomDataset, ValidationDataset
+from ssunet.models import Bit2Bit
+import pytorch_lightning as pl
+
+# Prepare data — ssunet expects 3D volume: (Z, X, Y) as float32
+# For flat TIFFs: stack individual frames into a volume per channel
+volume = np.stack([tifffile.imread(f) for f in frame_files]).astype(np.float32)
+data = SSUnetData(primary_data=volume)
+
+# Configs
+model_config = ModelConfig(channels=1, depth=4, start_filts=24, depth_scale=2,
+    z_conv_stage=3, group_norm=4, sin_encoding=False, loss_function="mse",
+    up_mode="transpose", activation="gelu", block_type="tri",
+    down_checkpointing=True)
+data_config = DataConfig(xy_size=256, z_size=32, virtual_size=600, random_crop=True)
+split_params = SplitParams(method="signal", min_p=0.3, max_p=0.7, normalize_target=True)
+loader_config = LoaderConfig(batch_size=2, num_workers=4, persistent_workers=True,
+    pin_memory=True, drop_last=True)
+
+# Datasets + loaders
+train_dataset = BinomDataset(data, data_config, split_params)
+val_dataset = ValidationDataset(data, data_config.validation_config)
+train_loader = loader_config.loader(train_dataset)
+val_loader = loader_config.loader(val_dataset)
+
+# Train
+model = Bit2Bit(model_config)
+trainer = pl.Trainer(accelerator="cuda", devices=[0], max_epochs=50,
+    gradient_clip_val=1.0, precision=32)
+trainer.fit(model, train_loader, val_loader)
+```
+
+Inference:
+```python
+from ssunet.tools.gpuinference import gpu_patch_inference
+
+denoised = gpu_patch_inference(model, volume.astype(np.float32),
+    min_overlap=16, initial_patch_depth=32, device=0)
+# Normalize intensity to match input
+denoised = denoised / np.mean(denoised) * np.mean(volume)
+```
+
+== TEST DATA ==
+
+Located at ~/Downloads/20250802_andrea_test_R0/R0/
+- 720 individual TIFFs, 4600x4168 pixels, uint16
+- 2 channels: 488_nm and 561_nm (360 frames each)
+- Naming: R0_0_0_Fluorescence_{wavelength}_Ex_-_single_band_{frame:04d}.tiff
+
+For training: stack frames per channel into a 3D volume.
+IMPORTANT: The full volume (360 x 4168 x 4600) is ~11 GB. For practical training:
+- Use a spatial crop (e.g. center 512x512 or 1024x1024)
+- Or use a subset of frames (e.g. 64-128 frames)
+- The training patches are only 256x256x32 anyway (configured via DataConfig)
+
+GPU: RTX 3060 Laptop (~6GB VRAM). Use down_checkpointing=True and batch_size=2.
+For inference on full-res frames: use grid_inference() which splits XY into patches too.
+
+== GUI DESIGN ==
+
+Same pattern as background_subtraction but with two phases:
+
+```
++--------------------------------------------------+
+| Denoising (ssunet)                          [_][X]|
++--------------------------------------------------+
+| Input: [path/to/folder]  [Browse...]               |
+| Detected: flat_tiffs, 2 channels, 360 frames each |
++--------------------------------------------------+
+| Training                                           |
+|   Epochs: [50]  Crop: [512]  Frames: [64]         |
+|   [  Train  ]                                      |
+|   [=========>              ] 45% epoch 23/50       |
+|   Model: [path/to/checkpoint]  [Load existing]     |
++--------------------------------------------------+
+| Denoise                                            |
+|   Channels: [x] 488nm  [x] 561nm                  |
+|   Output: [path/to/output]  [Browse...]            |
+|   [  Denoise All  ]                                |
+|   [=========>              ] 45%                   |
++--------------------------------------------------+
+| Preview (side-by-side original vs denoised)        |
+|   Frame: [slider] 0/359    Channel: [dropdown]     |
++--------------------------------------------------+
+```
+
+Workers:
+- TrainWorker(QThread) — runs trainer.fit() with progress callbacks
+- DenoiseWorker(QThread) — runs inference on all frames
+- PreviewWorker(QThread) — single frame denoise for preview
+
+== KEY CONSTRAINTS ==
+
+- Brutalist: minimal, clean, does its job. No overengineering.
+- The IO layer for reading acquisitions is already implemented in background_subtraction.
+  Copy src/bgsub/io/ (flat_tiffs.py, ome_tiff.py) into this project.
+- Generate high-res comparison figures (original vs denoised) for sharing with the team.
+- GPU required for practical use. The wrapper should detect CUDA and warn if unavailable.
+- Model output is in log-domain: apply torch.exp() to get the actual image.
+  The gpu_patch_inference function already handles this.
+
+== VERIFICATION ==
+
+1. Run scripts/test_denoise.py — trains on small crop, denoises, saves comparison PNG
+2. Launch GUI: python gui/app.py
+3. Browse to test data folder, train, preview denoised frames, run batch denoise

@@ -10,7 +10,7 @@ import torch
 from torch.cuda.amp.autocast_mode import autocast
 from tqdm import tqdm
 
-from ..ssunet.constants import LOGGER
+from ..constants import LOGGER
 
 
 class InvalidDataDimensionError(ValueError):
